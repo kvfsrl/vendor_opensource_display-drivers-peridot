@@ -400,6 +400,23 @@ static DEVICE_ATTR_RO(max_brightness_clone);
 static DEVICE_ATTR_RO(hw_vsync_info);
 static DEVICE_ATTR_RO(cell_id);
 static DEVICE_ATTR_RO(flatmode_check);
+static DEVICE_ATTR_RO(hoshikv_fod_state);
+
+/*
+ * hoshikv: read by libhoshikv (fod_event_thread) to drive onFpTouch.
+ * Value is '0' or '1' with a trailing newline; the lib only looks at buf[0].
+ */
+static ssize_t hoshikv_fod_state_show(struct device *device,
+			struct device_attribute *attr, char *buf)
+{
+	struct disp_display *dd_ptr = to_disp_display(device);
+	int state = 0;
+
+	if (dd_ptr->intf_type == MI_INTF_DSI)
+		state = mi_disp_lhbm_fod_state_pub_get(dd_ptr->disp_id);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", state);
+}
 
 
 static struct attribute *disp_feature_attrs[] = {
@@ -415,6 +432,7 @@ static struct attribute *disp_feature_attrs[] = {
 	&dev_attr_hw_vsync_info.attr,
 	&dev_attr_cell_id.attr,
 	&dev_attr_flatmode_check.attr,
+	&dev_attr_hoshikv_fod_state.attr,
 	NULL
 };
 

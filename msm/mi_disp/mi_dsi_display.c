@@ -1558,3 +1558,56 @@ MODULE_PARM_DESC(cell_id, "msm_drm.cell_id=<cell id> while <cell id> is 'cell id
 module_param_string(debugpolicy, display_debug_policy, MAX_DEBUG_POLICY_CMDLINE_LEN, 0600);
 MODULE_PARM_DESC(debugpolicy, "msm_drm.debugpolicy=<debug policy> to indicate supporting ramdump or not ");
 
+/*
+ * hoshikv doze2:
+ *   ensure() - arm doze brightness as soon as we are parked in doze, so the AOD
+ *              surface is actually visible without waiting for the HAL.
+ *   drop()   - clear it again as soon as the AOD surface is gone (aod2normal,
+ *              screen on, or FOD finished) so no doze state is left behind.
+ */
+void mi_dsi_hoshikv_doze_ensure(struct dsi_display *display)
+{
+	u32 cur = 0;
+	int rc;
+
+	if (!display || !display->panel)
+		return;
+
+	if (display->panel->power_mode != SDE_MODE_DPMS_LP1 &&
+		display->panel->power_mode != SDE_MODE_DPMS_LP2)
+		return;
+
+	if (is_hbm_fod_on(display->panel)) {
+		DISP_INFO("hoshikv-doze2: FOD HBM on, keep doze brightness\n");
+		return;
+	}
+
+	rc = mi_dsi_display_get_doze_brightness(display, &cur);
+	if (!rc && cur == DOZE_BRIGHTNESS_HBM)
+		return;
+
+	rc = mi_dsi_display_set_doze_brightness(display,
+			DOZE_BRIGHTNESS_HBM);
+	DISP_INFO("hoshikv-doze2: arm doze HBM, rc=%d\n", rc);
+}
+
+void mi_dsi_hoshikv_doze_drop(struct dsi_display *display)
+{
+	u32 cur = 0;
+
+	if (!display || !display->panel)
+		return;
+
+	/* still in doze and FOD is live -> keep it */
+	if ((display->panel->power_mode == SDE_MODE_DPMS_LP1 ||
+		display->panel->power_mode == SDE_MODE_DPMS_LP2) &&
+		is_hbm_fod_on(display->panel))
+		return;
+
+	if (!mi_dsi_display_get_doze_brightness(display, &cur) &&
+		cur == DOZE_TO_NORMAL)
+		return;
+
+	DISP_INFO("hoshikv-doze2: drop doze brightness to normal\n");
+	mi_dsi_display_set_doze_brightness(display, DOZE_TO_NORMAL);
+}

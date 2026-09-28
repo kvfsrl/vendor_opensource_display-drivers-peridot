@@ -1012,6 +1012,7 @@ static inline const char *getDispCountInfoTypeName(__u32 count_info_type)
 #define MI_DISP_IOCTL_SET_COUNT_INFO          _IOWR('D', 0x0D, struct disp_count_info_req)
 #define MI_DISP_IOCTL_SET_LOCAL_HBM            _IOW('D', 0x0E, struct disp_local_hbm_req)
 #define MI_DISP_IOCTL_GET_FEATURE             _IOWR('D', 0x0F, struct disp_feature_req)
+#define MI_DISP_IOCTL_SET_FOD_MODE            _IOWR('D', 0x10, struct disp_feature_req)
 
 #if defined(__cplusplus)
 }

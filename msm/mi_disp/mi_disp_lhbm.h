@@ -19,6 +19,20 @@
 
 #define NEED_UPDATE_TO_FOD_FPS 120
 
+/*
+ * hoshikv FOD-HBM
+ *   - doze 30Hz -> (FOD press) -> doze 120Hz + local HBM (HLPM)
+ *   - release  -> HBM off, hold 120Hz for HOSHIKV_FOD_HOLD_MS
+ *   - re-press -> reset hold timer (spam FOD tanpa bolak-balik 30/120)
+ *   - timeout  -> back to doze 30Hz
+ */
+#define HOSHIKV_FOD_DEBOUNCE_N		2
+#define HOSHIKV_FOD_HOLD_MS		3000
+#define HOSHIKV_FOD_HOLD_REARM_MS	500
+#define HOSHIKV_FOD_FPS_WAIT_MS		400
+#define HOSHIKV_FOD_POLL_MS		20
+#define HOSHIKV_FOD_TOUCH_MODE		10
+
 enum {
 	FOD_EVENT_UP = 0,
 	FOD_EVENT_DOWN = 1,
@@ -58,6 +72,18 @@ struct disp_lhbm_fod {
 	atomic_t target_brightness;
 
 	atomic_t disp_off_target_brightness;
+
+	/* hoshikv FOD watch */
+	struct task_struct *fod_watch_thread;
+	wait_queue_head_t fod_watch_wq;
+	atomic_t fod_watch_en;
+	atomic_t fod_press;		/* debounced state */
+	atomic_t fod_state_pub;		/* value exported to sysfs */
+	int fod_raw_last;
+	int fod_debounce;
+	int fod_hold_armed;
+	unsigned long fod_hold_deadline;
+	unsigned long fod_fps_last_notify;
 };
 
 struct lhbm_setting {
@@ -76,6 +102,9 @@ int mi_disp_lhbm_fod_update_layer_state(struct dsi_display *display,
 int mi_disp_lhbm_aod_to_normal_optimize(struct dsi_display *display,
 		bool enable);
 int mi_disp_set_local_hbm(int disp_id, int lhbm_value);
+int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id, bool enable);
+void mi_disp_lhbm_fod_watch_emit(int disp_id, int on);
+int mi_disp_lhbm_fod_state_pub_get(int disp_id);
 int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
 			u32 mi_gxzw_flags);
 int mi_disp_update_0size_lhbm_info(struct dsi_panel *panel);

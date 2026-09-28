@@ -420,6 +420,35 @@ static int mi_disp_ioctl_set_local_hbm(
 	return ret;
 }
 
+/*
+ * hoshikv: MI_DISP_IOCTL_SET_FOD_MODE. Mirrors libhoshikv exactly -
+ * feature_val is the enable flag, base.disp_id the display.
+ */
+static int mi_disp_ioctl_set_fod_mode(
+			struct disp_feature_client *client, void *data)
+{
+	struct disp_feature *df = client->df;
+	struct disp_feature_req *req = data;
+	int ret = 0;
+
+	if (!req || !is_support_disp_id(req->base.disp_id)) {
+		DISP_ERROR("unsupported display id\n");
+		return -EINVAL;
+	}
+
+	if (df->d_display[req->base.disp_id].intf_type != MI_INTF_DSI) {
+		DISP_ERROR("unsupported display intf\n");
+		return -EINVAL;
+	}
+
+	ret = mi_disp_lhbm_fod_watch_enable(df, req->base.disp_id,
+			req->feature_val ? true : false);
+	if (ret)
+		DISP_ERROR("fod watch toggle failed, ret=%d\n", ret);
+
+	return ret;
+}
+
 static void mi_disp_set_doze_brightness_work_handler(struct kthread_work *work)
 {
 	struct disp_work *cur_work = container_of(work,
@@ -924,6 +953,7 @@ static const struct disp_ioctl_desc disp_ioctls[] = {
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_GET_BRIGHTNESS, mi_disp_ioctl_get_brightness),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_GET_FEATURE, mi_disp_ioctl_get_feature),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_SET_LOCAL_HBM, mi_disp_ioctl_set_local_hbm),
+	DISP_IOCTL_DEF(MI_DISP_IOCTL_SET_FOD_MODE, mi_disp_ioctl_set_fod_mode),
 
 };
 

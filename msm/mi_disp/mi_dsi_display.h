@@ -152,3 +152,5 @@ int mi_dsi_display_cmd_write_locked(struct dsi_display *display, struct dsi_pane
 
 int mi_dsi_display_cmd_write(struct dsi_display *display, struct dsi_panel_cmd_set *cmd_sets);
 #endif /*_MI_DSI_DISPLAY_H_*/
+void mi_dsi_hoshikv_doze_ensure(struct dsi_display *display);
+void mi_dsi_hoshikv_doze_drop(struct dsi_display *display);

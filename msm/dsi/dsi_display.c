@@ -1483,6 +1483,7 @@ int dsi_display_set_power(struct drm_connector *connector,
 		}
 #endif
 		rc = dsi_panel_set_lp1(display->panel);
+		mi_dsi_hoshikv_doze_ensure(display);
 		break;
 	case SDE_MODE_DPMS_LP2:
 #ifdef MI_DISPLAY_MODIFY
@@ -1492,6 +1493,7 @@ int dsi_display_set_power(struct drm_connector *connector,
 		break;
 	case SDE_MODE_DPMS_ON:
 #ifdef MI_DISPLAY_MODIFY
+		mi_dsi_hoshikv_doze_drop(display);
 		if (mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PA ||
 			mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PB) {
 			if (atomic_add_unless(&display->vid_aod_wakelock_count, -1 , 0))

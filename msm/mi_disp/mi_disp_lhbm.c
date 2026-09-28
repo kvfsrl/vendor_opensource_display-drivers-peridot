@@ -12,6 +12,9 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/kthread.h>
+#include <linux/fs.h>
+#include <linux/ioctl.h>
+#include <linux/delay.h>
 #include <uapi/linux/sched/types.h>
 
 #include "sde_trace.h"
@@ -30,6 +33,29 @@
 static struct disp_lhbm_fod *g_lhbm_fod[MI_DISP_MAX];
 
 static int mi_disp_lhbm_fod_thread_fn(void *arg);
+static int mi_disp_lhbm_fod_watch_thread_fn(void *arg);
+
+/* hoshikv: xiaomi touch userspace ioctl contract (see libhoshikv) */
+#define HOSHIKV_XTS_DEV			"/dev/xiaomi-touch"
+#define HOSHIKV_XTS_IOCTL_BASE		'T'
+#define HOSHIKV_XTS_IOCTL_GET		0
+#define HOSHIKV_XTS_IOCTL_ENABLE	3
+#define HOSHIKV_XTS_MAX_VALUES		128
+
+struct hoshikv_xiaomi_touch_ioc_t {
+	u8 type;
+	u8 cmd;
+	u16 mode;
+	u16 len;
+	u16 res;
+	s32 value[HOSHIKV_XTS_MAX_VALUES];
+} __attribute__((packed));
+
+#define HOSHIKV_XTS_IOC_GET	_IOWR(HOSHIKV_XTS_IOCTL_BASE, \
+					HOSHIKV_XTS_IOCTL_GET, \
+					struct hoshikv_xiaomi_touch_ioc_t)
+#define HOSHIKV_XTS_IOC_ENABLE	_IO(HOSHIKV_XTS_IOCTL_BASE, \
+					HOSHIKV_XTS_IOCTL_ENABLE)
 
 bool is_local_hbm(int disp_id)
 {
@@ -108,6 +134,22 @@ int mi_disp_lhbm_fod_thread_create(struct disp_feature *df, int disp_id)
 	/* set realtime priority */
 	sched_set_fifo(lhbm_fod->fod_thread);
 
+	/* hoshikv FOD watch */
+	init_waitqueue_head(&lhbm_fod->fod_watch_wq);
+	atomic_set(&lhbm_fod->fod_watch_en, 0);
+	atomic_set(&lhbm_fod->fod_press, 0);
+	atomic_set(&lhbm_fod->fod_state_pub, 0);
+
+	lhbm_fod->fod_watch_thread = kthread_run(
+			mi_disp_lhbm_fod_watch_thread_fn, lhbm_fod,
+			"disp_fod_watch:%d", disp_id);
+	if (IS_ERR(lhbm_fod->fod_watch_thread)) {
+		DISP_ERROR("failed to create disp_fod_watch:%d kthread\n",
+			disp_id);
+		ret = PTR_ERR(lhbm_fod->fod_watch_thread);
+		lhbm_fod->fod_watch_thread = NULL;
+	}
+
 	g_lhbm_fod[disp_id] = lhbm_fod;
 
 	DISP_INFO("create disp_lhbm_fod:%d kthread success\n", disp_id);
@@ -131,6 +173,12 @@ int mi_disp_lhbm_fod_thread_destroy(struct disp_feature *df, int disp_id)
 
 	lhbm_fod = df->d_display[disp_id].lhbm_fod_ptr;
 	if (lhbm_fod) {
+		if (lhbm_fod->fod_watch_thread) {
+			atomic_set(&lhbm_fod->fod_watch_en, 0);
+			wake_up_interruptible(&lhbm_fod->fod_watch_wq);
+			kthread_stop(lhbm_fod->fod_watch_thread);
+			lhbm_fod->fod_watch_thread = NULL;
+		}
 		if (lhbm_fod->fod_thread) {
 			kthread_stop(lhbm_fod->fod_thread);
 			lhbm_fod->fod_thread = NULL;
@@ -231,6 +279,10 @@ int mi_disp_lhbm_fod_update_layer_state(struct dsi_display *display,
 	lhbm_fod->layer_flags = flags;
 	spin_unlock(&lhbm_fod->spinlock);
 
+	/* hoshikv doze2: no AOD surface left -> stop holding doze brightness */
+	if (!flags.aod_present && !flags.gxzw_anim_present)
+		mi_dsi_hoshikv_doze_drop(display);
+
 	return 0;
 }
 
@@ -254,7 +306,14 @@ static int mi_disp_lhbm_fod_event_notify(struct disp_lhbm_fod *lhbm_fod, int fod
 		return -EINVAL;
 	}
 	refresh_rate = display->panel->cur_mode->timing.refresh_rate;
-	if (fod_status == FOD_EVENT_FPS && refresh_rate == 30) {
+	/*
+	 * hoshikv: was `refresh_rate == 30`. That only covered the AOD rate, so a
+	 * panel sitting at 60Hz fell through and local HBM was injected at 60Hz,
+	 * which greys the screen until finger-up. Ask the HAL for the FOD rate
+	 * whenever we are not already at it.
+	 */
+	if (fod_status == FOD_EVENT_FPS &&
+		refresh_rate < NEED_UPDATE_TO_FOD_FPS) {
 		fod_ui_ready = LOCAL_HBM_NEED_UPDATE_TO_FOD_FPS;
 		mi_disp_feature_event_notify_by_type(disp_id, MI_DISP_EVENT_FOD,
 				sizeof(fod_ui_ready), fod_ui_ready);
@@ -615,5 +674,240 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
 	dsi_panel_release_panel_lock(panel);
 
 	return rc;
+}
+
+/* ===================== hoshikv FOD-HBM watch ===================== */
+
+static int hoshikv_fod_get_touch_status(int *status)
+{
+	struct hoshikv_xiaomi_touch_ioc_t d = {0};
+	int fd, rc = -EINVAL;
+
+	if (!status)
+		return -EINVAL;
+
+	fd = filp_open(HOSHIKV_XTS_DEV, O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return fd;
+
+	if (vfs_ioctl(fd, HOSHIKV_XTS_IOC_ENABLE, (unsigned long)0) >= 0) {
+		d.mode = HOSHIKV_FOD_TOUCH_MODE;
+		d.len = 1;
+		if (vfs_ioctl(fd, HOSHIKV_XTS_IOC_GET, (unsigned long)&d) >= 0) {
+			*status = d.value[0] ? 1 : 0;
+			rc = 0;
+		}
+	}
+
+	filp_close(fd, NULL);
+	return rc;
+}
+
+/*
+ * Protection: only inject HBM once the panel is actually parked in doze.
+ * power_mode DPMS_OFF (5) means the panel is mid-transition and any HBM
+ * injection there greys the screen.
+ */
+static bool hoshikv_fod_panel_stable(struct dsi_panel *panel)
+{
+	if (!panel) {
+		DISP_INFO("hoshikv-fod: no panel, skip HBM inj\n");
+		return false;
+	}
+
+	if (!dsi_panel_initialized(panel)) {
+		DISP_INFO("hoshikv-fod: panel not initialized, skip HBM inj\n");
+		return false;
+	}
+
+	if (panel->power_mode != SDE_MODE_DPMS_LP1 &&
+		panel->power_mode != SDE_MODE_DPMS_LP2) {
+		DISP_INFO("hoshikv-fod: panel power_mode=%d not stable,"
+			" skip HBM inj\n", panel->power_mode);
+		return false;
+	}
+
+	return true;
+}
+
+/* doze 30Hz -> doze 120Hz: ask HAL, then wait for the rate to land. */
+static int hoshikv_fod_force_fod_fps(struct disp_lhbm_fod *lhbm_fod)
+{
+	struct dsi_panel *panel = lhbm_fod->display->panel;
+	unsigned long deadline;
+	u32 rate = 0;
+	int rc = 0;
+
+	rc = mi_disp_lhbm_fod_event_notify(lhbm_fod, FOD_EVENT_FPS);
+	if (rc != -NEED_UPDATE_TO_FOD_FPS)
+		return 0;
+
+	deadline = jiffies + msecs_to_jiffies(HOSHIKV_FOD_FPS_WAIT_MS);
+	do {
+		rate = panel->cur_mode->timing.refresh_rate;
+		if (rate >= NEED_UPDATE_TO_FOD_FPS)
+			break;
+		usleep_range(2000, 3000);
+	} while (time_before(jiffies, deadline));
+
+	rate = panel->cur_mode->timing.refresh_rate;
+	if (rate < NEED_UPDATE_TO_FOD_FPS) {
+		DISP_INFO("hoshikv-fod: fod fps wait timeout, rate=%d\n", rate);
+		return -ETIMEDOUT;
+	}
+
+	DISP_INFO("hoshikv-fod: fod fps ready, rate=%d\n", rate);
+	return 0;
+}
+
+static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
+{
+	struct dsi_display *display = lhbm_fod->display;
+	int disp_id = mi_get_disp_id(display->display_type);
+
+	if (!hoshikv_fod_panel_stable(display->panel))
+		return;
+
+	/* route to doze 120Hz *before* the HBM goes on */
+	if (hoshikv_fod_force_fod_fps(lhbm_fod))
+		DISP_INFO("hoshikv-fod: injecting HBM without confirmed fod fps\n");
+
+	/* (re)start the 3s hold so back-to-back touches keep doze at 120Hz */
+	lhbm_fod->fod_hold_deadline =
+		jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
+	lhbm_fod->fod_hold_armed = 1;
+
+	DISP_INFO("hoshikv-fod: press detected\n");
+	mi_disp_set_local_hbm(disp_id, LHBM_TARGET_BRIGHTNESS_WHITE_1000NIT);
+}
+
+static void hoshikv_fod_release(struct disp_lhbm_fod *lhbm_fod)
+{
+	int disp_id = mi_get_disp_id(lhbm_fod->display->display_type);
+
+	/* HBM off, but keep doze at 120Hz until the hold expires */
+	lhbm_fod->fod_hold_deadline =
+		jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
+	lhbm_fod->fod_hold_armed = 1;
+
+	DISP_INFO("hoshikv-fod: release detected\n");
+	mi_disp_set_local_hbm(disp_id, LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
+}
+
+/* hold doze at 120Hz until the deadline, then fall back to doze 30Hz. */
+static void hoshikv_fod_hold_tick(struct disp_lhbm_fod *lhbm_fod)
+{
+	if (!lhbm_fod->fod_hold_armed)
+		return;
+
+	if (time_after_eq(jiffies, lhbm_fod->fod_hold_deadline)) {
+		lhbm_fod->fod_hold_armed = 0;
+		DISP_INFO("hoshikv-fod: hold timeout, back to doze 30Hz\n");
+		mi_disp_lhbm_fod_event_notify(lhbm_fod, FOD_EVENT_UP);
+		mi_dsi_display_set_doze_brightness(lhbm_fod->display,
+				DOZE_BRIGHTNESS_HBM);
+		return;
+	}
+
+	/* keep re-asserting the fod rate while inside the hold window */
+	if (time_after_eq(jiffies, lhbm_fod->fod_fps_last_notify +
+			msecs_to_jiffies(HOSHIKV_FOD_HOLD_REARM_MS))) {
+		lhbm_fod->fod_fps_last_notify = jiffies;
+		mi_disp_lhbm_fod_event_notify(lhbm_fod, FOD_EVENT_FPS);
+	}
+}
+
+static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
+{
+	struct disp_lhbm_fod *lhbm_fod = (struct disp_lhbm_fod *)arg;
+	int raw = 0;
+
+	while (!kthread_should_stop()) {
+		if (!atomic_read(&lhbm_fod->fod_watch_en)) {
+			lhbm_fod->fod_debounce = 0;
+			wait_event_interruptible_timeout(lhbm_fod->fod_watch_wq,
+					!atomic_read(&lhbm_fod->fod_watch_en),
+					msecs_to_jiffies(HOSHIKV_FOD_POLL_MS));
+			continue;
+		}
+
+		if (!hoshikv_fod_get_touch_status(&raw)) {
+			if (raw != lhbm_fod->fod_raw_last) {
+				lhbm_fod->fod_raw_last = raw;
+				lhbm_fod->fod_debounce = 0;
+			} else if (lhbm_fod->fod_debounce <
+					HOSHIKV_FOD_DEBOUNCE_N) {
+				lhbm_fod->fod_debounce++;
+			}
+
+			if (lhbm_fod->fod_debounce >= HOSHIKV_FOD_DEBOUNCE_N &&
+				raw != atomic_read(&lhbm_fod->fod_press)) {
+				atomic_set(&lhbm_fod->fod_press, raw);
+				if (raw)
+					hoshikv_fod_press(lhbm_fod);
+				else
+					hoshikv_fod_release(lhbm_fod);
+				/* keep userspace in sync either way */
+				mi_disp_lhbm_fod_watch_emit(
+					mi_get_disp_id(lhbm_fod->display->display_type),
+					raw);
+			}
+		}
+
+		hoshikv_fod_hold_tick(lhbm_fod);
+		msleep(HOSHIKV_FOD_POLL_MS);
+	}
+
+	return 0;
+}
+
+int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id,
+		bool enable)
+{
+	struct disp_lhbm_fod *lhbm_fod = mi_get_disp_lhbm_fod(disp_id);
+
+	if (!lhbm_fod) {
+		DISP_ERROR("%s invalid lhbm_fod ptr\n", get_disp_id_name(disp_id));
+		return -EINVAL;
+	}
+
+	atomic_set(&lhbm_fod->fod_watch_en, enable);
+	lhbm_fod->fod_debounce = 0;
+	lhbm_fod->fod_hold_armed = 0;
+
+	if (enable) {
+		atomic_set(&lhbm_fod->fod_press, 0);
+		lhbm_fod->fod_fps_last_notify = jiffies;
+	} else {
+		atomic_set(&lhbm_fod->fod_press, 0);
+		mi_disp_set_local_hbm(disp_id,
+				LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
+		mi_disp_lhbm_fod_watch_emit(disp_id, 0);
+	}
+
+	wake_up_interruptible(&lhbm_fod->fod_watch_wq);
+	DISP_INFO("hoshikv-fod: watch %s\n", enable ? "enable" : "disable");
+	return 0;
+}
+
+void mi_disp_lhbm_fod_watch_emit(int disp_id, int on)
+{
+	struct disp_lhbm_fod *lhbm_fod = mi_get_disp_lhbm_fod(disp_id);
+
+	if (!lhbm_fod)
+		return;
+
+	atomic_set(&lhbm_fod->fod_state_pub, !!on);
+	DISP_INFO("hoshikv-fod: watch emit onFpTouch=%d\n", !!on);
+}
+
+int mi_disp_lhbm_fod_state_pub_get(int disp_id)
+{
+	struct disp_lhbm_fod *lhbm_fod = mi_get_disp_lhbm_fod(disp_id);
+
+	if (!lhbm_fod)
+		return -EINVAL;
+
+	return atomic_read(&lhbm_fod->fod_state_pub);
 }
 
