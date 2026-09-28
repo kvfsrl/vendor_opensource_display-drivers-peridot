@@ -16,6 +16,7 @@
 #include "mi_disp_print.h"
 #include "mi_dsi_display.h"
 #include "mi_disp_feature.h"
+#include "mi_disp_lhbm.h"
 
 #define to_disp_display(d) dev_get_drvdata(d)
 
@@ -400,8 +401,6 @@ static DEVICE_ATTR_RO(max_brightness_clone);
 static DEVICE_ATTR_RO(hw_vsync_info);
 static DEVICE_ATTR_RO(cell_id);
 static DEVICE_ATTR_RO(flatmode_check);
-static DEVICE_ATTR_RO(hoshikv_fod_state);
-
 /*
  * hoshikv: read by libhoshikv (fod_event_thread) to drive onFpTouch.
  * Value is '0' or '1' with a trailing newline; the lib only looks at buf[0].
@@ -417,6 +416,8 @@ static ssize_t hoshikv_fod_state_show(struct device *device,
 
 	return snprintf(buf, PAGE_SIZE, "%d\n", state);
 }
+
+static DEVICE_ATTR_RO(hoshikv_fod_state);
 
 
 static struct attribute *disp_feature_attrs[] = {
