@@ -681,25 +681,26 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
 static int hoshikv_fod_get_touch_status(int *status)
 {
 	struct hoshikv_xiaomi_touch_ioc_t d = {0};
-	int fd, rc = -EINVAL;
+	struct file *filp;
+	int rc = -EINVAL;
 
 	if (!status)
 		return -EINVAL;
 
-	fd = filp_open(HOSHIKV_XTS_DEV, O_RDWR | O_CLOEXEC);
-	if (fd < 0)
-		return fd;
+	filp = filp_open(HOSHIKV_XTS_DEV, O_RDWR | O_CLOEXEC, 0);
+	if (IS_ERR(filp))
+		return PTR_ERR(filp);
 
-	if (vfs_ioctl(fd, HOSHIKV_XTS_IOC_ENABLE, (unsigned long)0) >= 0) {
+	if (vfs_ioctl(filp, HOSHIKV_XTS_IOC_ENABLE, 0UL) >= 0) {
 		d.mode = HOSHIKV_FOD_TOUCH_MODE;
 		d.len = 1;
-		if (vfs_ioctl(fd, HOSHIKV_XTS_IOC_GET, (unsigned long)&d) >= 0) {
+		if (vfs_ioctl(filp, HOSHIKV_XTS_IOC_GET, (unsigned long)&d) >= 0) {
 			*status = d.value[0] ? 1 : 0;
 			rc = 0;
 		}
 	}
 
-	filp_close(fd, NULL);
+	filp_close(filp, NULL);
 	return rc;
 }
 
