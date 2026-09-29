@@ -683,8 +683,11 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
  * Notification-driven FOD capture, wired to libhoshikv:
  *   - the fod_watch kthread is armed/stopped ONLY by
  *     MI_DISP_IOCTL_SET_FOD_MODE (disp_feature_req.feature_val), mirroring
- *     libhoshikv k()/v() -> fod_mode_set(fd, 1/0). No auto-arm at AOD entry and
- *     no polling of /dev/xiaomi-touch mode 10.
+ *     libhoshikv k()/v(). No auto-arm at AOD entry and no polling of
+ *     /dev/xiaomi-touch mode 10.
+ *   - SET_FOD_MODE on == forced press: HBM on immediately (even with the
+ *     screen awake, where the touch driver drops FOD events) and state=1.
+ *   - SET_FOD_MODE off == release: HBM off and state=0.
  *   - while armed the kthread is the SOLE reader of fod_press_status. Instead
  *     of polling it injects a wait_queue_entry into the node's kernfs poll
  *     waitqueue (via the file's ->poll()) so it wakes on each sysfs_notify.
@@ -696,7 +699,8 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
  *               poll(POLLPRI) -> onFpTouch(true)), doze 120Hz + local HBM
  *   - release -> mirror 0 + sysfs_notify (onFpTouch(false)), HBM off,
  *               hold doze 120Hz until HOSHIKV_FOD_HOLD_MS then 30Hz
- */
+ *   - the watcher only acts on value transitions and always sleeps between
+ *     reads, so nodes that keep poll() ready forever cannot busy-loop it.
 
 /*
  * Protection: only inject HBM once the panel is actually parked in doze.
@@ -715,7 +719,8 @@ static bool hoshikv_fod_panel_stable(struct dsi_panel *panel)
 		return false;
 	}
 
-	if (panel->power_mode != SDE_MODE_DPMS_LP1 &&
+	if (panel->power_mode != SDE_MODE_DPMS_ON &&
+		panel->power_mode != SDE_MODE_DPMS_LP1 &&
 		panel->power_mode != SDE_MODE_DPMS_LP2) {
 		DISP_INFO("hoshikv-fod: panel power_mode=%d not stable,"
 			" skip HBM inj\n", panel->power_mode);
@@ -769,19 +774,26 @@ static void hoshikv_fod_publish(struct disp_lhbm_fod *lhbm_fod, int on)
 static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
 {
 	struct dsi_display *display = lhbm_fod->display;
+	struct dsi_panel *panel = display->panel;
 	int disp_id = mi_get_disp_id(display->display_type);
+	bool in_doze;
 
-	if (!hoshikv_fod_panel_stable(display->panel))
+	if (!hoshikv_fod_panel_stable(panel))
 		return;
 
-	/* route to doze 120Hz *before* the HBM goes on */
-	if (hoshikv_fod_force_fod_fps(lhbm_fod))
-		DISP_INFO("hoshikv-fod: injecting HBM without confirmed fod fps\n");
+	in_doze = (panel->power_mode == SDE_MODE_DPMS_LP1 ||
+		   panel->power_mode == SDE_MODE_DPMS_LP2);
 
-	/* (re)start the 3s hold so back-to-back touches keep doze at 120Hz */
-	lhbm_fod->fod_hold_deadline =
-		jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
-	lhbm_fod->fod_hold_armed = 1;
+	if (in_doze) {
+		/* route to doze 120Hz *before* the HBM goes on */
+		if (hoshikv_fod_force_fod_fps(lhbm_fod))
+			DISP_INFO("hoshikv-fod: injecting HBM without confirmed fod fps\n");
+
+		/* (re)start the 3s hold so back-to-back touches keep doze at 120Hz */
+		lhbm_fod->fod_hold_deadline =
+			jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
+		lhbm_fod->fod_hold_armed = 1;
+	}
 
 	DISP_INFO("hoshikv-fod: press detected\n");
 	mi_disp_set_local_hbm(disp_id, LHBM_TARGET_BRIGHTNESS_WHITE_1000NIT);
@@ -954,7 +966,7 @@ static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 			continue;
 		}
 
-		/* consume any press that landed before the node was opened */
+		/* prime the baseline so only real edges trigger press/release */
 		mutex_lock(&lhbm_fod->fod_touch_lock);
 		cur = hoshikv_fod_touch_read(lhbm_fod);
 		mutex_unlock(&lhbm_fod->fod_touch_lock);
@@ -966,6 +978,7 @@ static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 		/* wait for press/release notifications on the touch node */
 		while (!kthread_should_stop() &&
 				atomic_read(&lhbm_fod->fod_watch_en)) {
+			int last = cur;
 			__poll_t revents;
 
 			mutex_lock(&lhbm_fod->fod_touch_lock);
@@ -978,21 +991,24 @@ static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 			revents = lhbm_fod->fod_touch_file->f_op->poll(
 					lhbm_fod->fod_touch_file,
 					&lhbm_fod->fod_poll_pt);
-			if (revents & (POLLPRI | POLLERR | POLLIN)) {
+			if (revents & (POLLPRI | POLLERR | POLLIN))
 				cur = hoshikv_fod_touch_read(lhbm_fod);
-				mutex_unlock(&lhbm_fod->fod_touch_lock);
+			mutex_unlock(&lhbm_fod->fod_touch_lock);
 
+			hoshikv_fod_hold_tick(lhbm_fod);
+
+			/* act only on a value transition; poll may stay ready even
+			 * when the value is unchanged, so this is what keeps the
+			 * kthread from busy-looping on a flat value */
+			if (cur != last) {
 				hoshikv_fod_publish(lhbm_fod, cur);
 				if (cur)
 					hoshikv_fod_press(lhbm_fod);
 				else
 					hoshikv_fod_release(lhbm_fod);
-				break;
 			}
-			mutex_unlock(&lhbm_fod->fod_touch_lock);
 
-			hoshikv_fod_hold_tick(lhbm_fod);
-
+			/* bounded sleep floor (awake nodes can report ready forever) */
 			wait_event_interruptible_timeout(lhbm_fod->fod_poll_wq,
 					kthread_should_stop() ||
 					!atomic_read(&lhbm_fod->fod_watch_en) ||
@@ -1025,6 +1041,12 @@ int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id,
 		atomic_set(&lhbm_fod->fod_poll_event, 0);
 		lhbm_fod->fod_hold_armed = 0;
 		lhbm_fod->fod_fps_last_notify = jiffies;
+
+		/* SET_FOD_MODE on == forced press: light HBM immediately (works
+		 * awake, where the touch driver drops FOD events, and in doze)
+		 * and mirror hoshikv_fod_state for the lib's poll */
+		hoshikv_fod_press(lhbm_fod);
+		hoshikv_fod_publish(lhbm_fod, 1);
 	} else {
 		atomic_set(&lhbm_fod->fod_watch_en, 0);
 		atomic_set(&lhbm_fod->fod_press, 0);

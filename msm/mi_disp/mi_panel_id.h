@@ -24,7 +24,17 @@
 #define N11U_42_02_0A_PANEL_ID 0x4E31315500420200
 #define N9_42_02_0A_PANEL_ID   0x00004E3950420200
 #define N16T_42_02_0A_PANEL_ID    0x4E31365400420200
+#define N16T_42_0A_0C_PANEL_ID    0x4E31365400420A0C
 #define N16T_36_0F_0B_PANEL_ID    0x4E31365400360F01
+
+/*
+ * peridot's N16T panels differ only in the last (production-batch) byte:
+ *   n16t_42_02_0a -> 0x4E3136540042020A
+ *   n16t_42_0a_0c -> 0x4E31365400420A0C
+ *   n16t_36_0f_0b -> 0x4E31365400360F0B
+ * Match on the family (batch byte masked) so every NT37706 variant is seen.
+ */
+#define N16T_BATCH_MASK           0xFFFFFFFFFFFFFF00ULL
 
 
 /* PA: Primary display, First selection screen
@@ -72,7 +82,9 @@ enum mi_project_panel_id {
 
 static inline enum mi_project_panel_id mi_get_panel_id(u64 mi_panel_id)
 {
-	switch(mi_panel_id) {
+	u64 n16t = mi_panel_id & N16T_BATCH_MASK;
+
+	switch (mi_panel_id) {
 	case N1_42_02_0A_PANEL_ID:
 		return N1_PANEL_PA;
 	case N2_42_02_0A_PANEL_ID:
@@ -83,13 +95,18 @@ static inline enum mi_project_panel_id mi_get_panel_id(u64 mi_panel_id)
 		return N11U_PANEL_PA;
 	case N9_42_02_0A_PANEL_ID:
 		return N9_PANEL_PA;
-	case N16T_42_02_0A_PANEL_ID:
-		return N16T_PANEL_PA;
-	case N16T_36_0F_0B_PANEL_ID:
-		return N16T_PANEL_PB;
 	default:
-		return PANEL_ID_INVALID;
+		break;
 	}
+
+	/* N16T (Novatek NT37706): tolerate any production-batch byte */
+	if (n16t == (N16T_42_02_0A_PANEL_ID & N16T_BATCH_MASK) ||
+		n16t == (N16T_42_0A_0C_PANEL_ID & N16T_BATCH_MASK))
+		return N16T_PANEL_PA;
+	if (n16t == (N16T_36_0F_0B_PANEL_ID & N16T_BATCH_MASK))
+		return N16T_PANEL_PB;
+
+	return PANEL_ID_INVALID;
 }
 
 static inline const char *mi_get_panel_id_name(u64 mi_panel_id)
@@ -128,13 +145,13 @@ static inline bool is_use_nt37801_dsc_config(u64 mi_panel_id)
 
 static inline bool is_use_nt37706_dsc_config(u64 mi_panel_id)
 {
-	switch(mi_panel_id) {
-	case N16T_42_02_0A_PANEL_ID:
-	case N16T_36_0F_0B_PANEL_ID:
+	u64 n16t = mi_panel_id & N16T_BATCH_MASK;
+
+	if (n16t == (N16T_42_02_0A_PANEL_ID & N16T_BATCH_MASK) ||
+		n16t == (N16T_42_0A_0C_PANEL_ID & N16T_BATCH_MASK) ||
+		n16t == (N16T_36_0F_0B_PANEL_ID & N16T_BATCH_MASK))
 		return true;
-	default:
-		return false;
-	}
+	return false;
 }
 
 
