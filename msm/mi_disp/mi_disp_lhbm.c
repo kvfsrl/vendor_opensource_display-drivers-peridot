@@ -511,10 +511,19 @@ static int mi_disp_lhbm_fod_thread_fn(void *arg)
 				lhbm_setting_event.lhbm_value != LHBM_TARGET_BRIGHTNESS_OFF_AUTH_STOP) {
 				rc = mi_disp_lhbm_fod_event_notify(lhbm_fod, FOD_EVENT_FPS);
 				if (rc == -NEED_UPDATE_TO_FOD_FPS) {
-					mi_disp_lhbm_fod_allow_tx_lhbm(lhbm_fod->display, false);
-					DISP_INFO("Stop to allow tx lhbm, wait to swtich fod fps!");
-					spin_unlock_irqrestore(&lhbm_fod->spinlock, flag);
-					continue;
+					/* custom ROM without the fod-fps HAL handshake can
+					 * leave the panel at 30Hz forever; fall back to
+					 * injecting HBM anyway (hoshikv best effort) */
+					if (lhbm_fod->fod_fps_best_effort) {
+						rc = 0;
+						DISP_INFO("hoshikv-fod: best effort, inject "
+							"HBM at current fps\n");
+					} else {
+						mi_disp_lhbm_fod_allow_tx_lhbm(lhbm_fod->display, false);
+						DISP_INFO("Stop to allow tx lhbm, wait to swtich fod fps!");
+						spin_unlock_irqrestore(&lhbm_fod->spinlock, flag);
+						continue;
+					}
 				}
 			}
 		}
@@ -753,7 +762,9 @@ static int hoshikv_fod_force_fod_fps(struct disp_lhbm_fod *lhbm_fod)
 
 	rate = panel->cur_mode->timing.refresh_rate;
 	if (rate < NEED_UPDATE_TO_FOD_FPS) {
-		DISP_INFO("hoshikv-fod: fod fps wait timeout, rate=%d\n", rate);
+		DISP_INFO("hoshikv-fod: fod fps wait timeout, rate=%d -> "
+			"best effort HBM\n", rate);
+		lhbm_fod->fod_fps_best_effort = 1;
 		return -ETIMEDOUT;
 	}
 
@@ -808,6 +819,7 @@ static void hoshikv_fod_release(struct disp_lhbm_fod *lhbm_fod)
 	lhbm_fod->fod_hold_deadline =
 		jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
 	lhbm_fod->fod_hold_armed = 1;
+	lhbm_fod->fod_fps_best_effort = 0;
 
 	DISP_INFO("hoshikv-fod: release detected\n");
 	mi_disp_set_local_hbm(disp_id, LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
@@ -822,9 +834,9 @@ static void hoshikv_fod_hold_tick(struct disp_lhbm_fod *lhbm_fod)
 	if (time_after_eq(jiffies, lhbm_fod->fod_hold_deadline)) {
 		lhbm_fod->fod_hold_armed = 0;
 		DISP_INFO("hoshikv-fod: hold timeout, back to doze 30Hz\n");
+		/* own 30Hz restore: drop the FOD fps rate via the event protocol,
+		 * no Xiaomi doze_brightness involvement */
 		mi_disp_lhbm_fod_event_notify(lhbm_fod, FOD_EVENT_UP);
-		mi_dsi_display_set_doze_brightness(lhbm_fod->display,
-				DOZE_BRIGHTNESS_HBM);
 		return;
 	}
 
@@ -1042,6 +1054,7 @@ int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id,
 		atomic_set(&lhbm_fod->fod_poll_event, 0);
 		lhbm_fod->fod_hold_armed = 0;
 		lhbm_fod->fod_fps_last_notify = jiffies;
+		lhbm_fod->fod_fps_best_effort = 0;
 
 		/* SET_FOD_MODE on == forced press: light HBM immediately (works
 		 * awake, where the touch driver drops FOD events, and in doze)
