@@ -14,6 +14,7 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/poll.h>
 #include <linux/sysfs.h>
 #include <uapi/linux/sched/types.h>
@@ -60,6 +61,15 @@ bool mi_disp_lhbm_fod_enabled(struct dsi_panel *panel)
 {
 	return panel ? panel->mi_cfg.local_hbm_enabled : false;
 }
+
+/* forward decls: the fod_watch helpers below are static but used from
+ * thread_create/thread_destroy which appear earlier in the file.
+ */
+static void hoshikv_fod_poll_qproc(struct file *fp,
+		wait_queue_head_t *wq, struct poll_table_struct *pt);
+static int hoshikv_fod_poll_wqfunc_entry(struct wait_queue_entry *entry,
+		unsigned int mode, int flags, void *key);
+static void hoshikv_fod_touch_close(struct disp_lhbm_fod *lhbm_fod);
 
 int mi_disp_lhbm_fod_thread_create(struct disp_feature *df, int disp_id)
 {
