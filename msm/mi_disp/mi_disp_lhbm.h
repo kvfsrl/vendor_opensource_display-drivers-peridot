@@ -11,6 +11,10 @@
 #include <linux/wait.h>
 #include <linux/kthread.h>
 #include <linux/atomic.h>
+#include <linux/fs.h>
+#include <linux/poll.h>
+#include <linux/mutex.h>
+#include <linux/device.h>
 
 #include "dsi_panel.h"
 #include "dsi_display.h"
@@ -21,17 +25,28 @@
 
 /*
  * hoshikv FOD-HBM
- *   - doze 30Hz -> (FOD press) -> doze 120Hz + local HBM (HLPM)
- *   - release  -> HBM off, hold 120Hz for HOSHIKV_FOD_HOLD_MS
+ *   - notification-driven: the fod_watch kthread is armed/stopped ONLY by
+ *     MI_DISP_IOCTL_SET_FOD_MODE (disp_feature_req feature_val), matching
+ *     libhoshikv (k()/v() -> fod_mode_set 1/0). No auto-arm at doze entry and
+ *     no polling of /dev/xiaomi-touch mode 10.
+ *   - while armed the kthread is the SOLE reader of
+ *     /sys/class/touch/touch_dev/fod_press_status: it waits for the node's
+ *     kernfs notification (POLLPRI) instead of polling, then consumes the
+ *     oneshot value. Touch `notify_oneshot_sensor(ONESHOT_SENSOR_FOD_PRESS, 1)`
+ *     on press and (..., 0) on release both sysfs_notify -> hoshikv_fod_poll_*
+ *     lets us see per-edge press/release without patching the touch driver.
+ *   - press -> mirror hoshikv_fod_state to 1, sysfs_notify (lib's
+ *     poll(POLLPRI) wakes onFpTouch(true)), doze 120Hz + local HBM (HLPM)
+ *   - release -> mirror 0 + sysfs_notify (onFpTouch(false)), HBM off,
+ *     hold doze 120Hz until HOSHIKV_FOD_HOLD_MS then drop to doze 30Hz
  *   - re-press -> reset hold timer (spam FOD tanpa bolak-balik 30/120)
- *   - timeout  -> back to doze 30Hz
  */
-#define HOSHIKV_FOD_DEBOUNCE_N		2
 #define HOSHIKV_FOD_HOLD_MS		3000
 #define HOSHIKV_FOD_HOLD_REARM_MS	500
 #define HOSHIKV_FOD_FPS_WAIT_MS		400
-#define HOSHIKV_FOD_POLL_MS		20
-#define HOSHIKV_FOD_TOUCH_MODE		10
+#define HOSHIKV_FOD_WAIT_MS		250
+#define HOSHIKV_FOD_TOUCH_NODE		"/sys/class/touch/touch_dev/fod_press_status"
+#define HOSHIKV_FOD_STATE_ATTR		"hoshikv_fod_state"
 
 enum {
 	FOD_EVENT_UP = 0,
@@ -73,14 +88,21 @@ struct disp_lhbm_fod {
 
 	atomic_t disp_off_target_brightness;
 
-	/* hoshikv FOD watch */
+	/* hoshikv FOD watch (notification-driven) */
 	struct task_struct *fod_watch_thread;
 	wait_queue_head_t fod_watch_wq;
+	struct mutex fod_touch_lock;	/* guards the touch node file + poll */
+	struct file *fod_touch_file;	/* filp on fod_press_status while armed */
+	struct poll_table_struct fod_poll_pt;	/* poll hook: _qproc = ..._qproc */
+	bool fod_poll_hooked;
+	wait_queue_head_t *fod_poll_parent;	/* touch kernfs on->poll */
+	wait_queue_entry_t fod_poll_entry;	/* injected into fod_poll_parent */
+	atomic_t fod_poll_event;	/* 1 = touch node notified us */
+	wait_queue_head_t fod_poll_wq;	/* woken by fod_poll_entry.func */
+	struct device *fod_sysdev;	/* disp_display device for sysfs_notify */
 	atomic_t fod_watch_en;
-	atomic_t fod_press;		/* debounced state */
+	atomic_t fod_press;		/* current press state from touch */
 	atomic_t fod_state_pub;		/* value exported to sysfs */
-	int fod_raw_last;
-	int fod_debounce;
 	int fod_hold_armed;
 	unsigned long fod_hold_deadline;
 	unsigned long fod_fps_last_notify;
@@ -103,7 +125,6 @@ int mi_disp_lhbm_aod_to_normal_optimize(struct dsi_display *display,
 		bool enable);
 int mi_disp_set_local_hbm(int disp_id, int lhbm_value);
 int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id, bool enable);
-void mi_disp_lhbm_fod_watch_emit(int disp_id, int on);
 int mi_disp_lhbm_fod_state_pub_get(int disp_id);
 int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
 			u32 mi_gxzw_flags);

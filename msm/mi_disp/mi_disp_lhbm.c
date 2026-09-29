@@ -12,9 +12,10 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/kthread.h>
-#include <linux/fs.h>
-#include <linux/ioctl.h>
 #include <linux/delay.h>
+#include <linux/fs.h>
+#include <linux/poll.h>
+#include <linux/sysfs.h>
 #include <uapi/linux/sched/types.h>
 
 #include "sde_trace.h"
@@ -34,28 +35,6 @@ static struct disp_lhbm_fod *g_lhbm_fod[MI_DISP_MAX];
 
 static int mi_disp_lhbm_fod_thread_fn(void *arg);
 static int mi_disp_lhbm_fod_watch_thread_fn(void *arg);
-
-/* hoshikv: xiaomi touch userspace ioctl contract (see libhoshikv) */
-#define HOSHIKV_XTS_DEV			"/dev/xiaomi-touch"
-#define HOSHIKV_XTS_IOCTL_BASE		'T'
-#define HOSHIKV_XTS_IOCTL_GET		0
-#define HOSHIKV_XTS_IOCTL_ENABLE	3
-#define HOSHIKV_XTS_MAX_VALUES		128
-
-struct hoshikv_xiaomi_touch_ioc_t {
-	u8 type;
-	u8 cmd;
-	u16 mode;
-	u16 len;
-	u16 res;
-	s32 value[HOSHIKV_XTS_MAX_VALUES];
-} __attribute__((packed));
-
-#define HOSHIKV_XTS_IOC_GET	_IOWR(HOSHIKV_XTS_IOCTL_BASE, \
-					HOSHIKV_XTS_IOCTL_GET, \
-					struct hoshikv_xiaomi_touch_ioc_t)
-#define HOSHIKV_XTS_IOC_ENABLE	_IO(HOSHIKV_XTS_IOCTL_BASE, \
-					HOSHIKV_XTS_IOCTL_ENABLE)
 
 bool is_local_hbm(int disp_id)
 {
@@ -136,6 +115,13 @@ int mi_disp_lhbm_fod_thread_create(struct disp_feature *df, int disp_id)
 
 	/* hoshikv FOD watch */
 	init_waitqueue_head(&lhbm_fod->fod_watch_wq);
+	mutex_init(&lhbm_fod->fod_touch_lock);
+	init_waitqueue_head(&lhbm_fod->fod_poll_wq);
+	lhbm_fod->fod_poll_pt._qproc = hoshikv_fod_poll_qproc;
+	lhbm_fod->fod_poll_pt._key = POLLPRI | POLLERR | POLLIN;
+	init_waitqueue_func_entry(&lhbm_fod->fod_poll_entry,
+			hoshikv_fod_poll_wqfunc_entry);
+	lhbm_fod->fod_sysdev = df->d_display[disp_id].dev;
 	atomic_set(&lhbm_fod->fod_watch_en, 0);
 	atomic_set(&lhbm_fod->fod_press, 0);
 	atomic_set(&lhbm_fod->fod_state_pub, 0);
@@ -175,7 +161,11 @@ int mi_disp_lhbm_fod_thread_destroy(struct disp_feature *df, int disp_id)
 	if (lhbm_fod) {
 		if (lhbm_fod->fod_watch_thread) {
 			atomic_set(&lhbm_fod->fod_watch_en, 0);
+			mutex_lock(&lhbm_fod->fod_touch_lock);
+			hoshikv_fod_touch_close(lhbm_fod);
+			mutex_unlock(&lhbm_fod->fod_touch_lock);
 			wake_up_interruptible(&lhbm_fod->fod_watch_wq);
+			wake_up_interruptible(&lhbm_fod->fod_poll_wq);
 			kthread_stop(lhbm_fod->fod_watch_thread);
 			lhbm_fod->fod_watch_thread = NULL;
 		}
@@ -676,33 +666,27 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
 	return rc;
 }
 
+
 /* ===================== hoshikv FOD-HBM watch ===================== */
 
-static int hoshikv_fod_get_touch_status(int *status)
-{
-	struct hoshikv_xiaomi_touch_ioc_t d = {0};
-	struct file *filp;
-	int rc = -EINVAL;
-
-	if (!status)
-		return -EINVAL;
-
-	filp = filp_open(HOSHIKV_XTS_DEV, O_RDWR | O_CLOEXEC, 0);
-	if (IS_ERR(filp))
-		return PTR_ERR(filp);
-
-	if (vfs_ioctl(filp, HOSHIKV_XTS_IOC_ENABLE, 0UL) >= 0) {
-		d.mode = HOSHIKV_FOD_TOUCH_MODE;
-		d.len = 1;
-		if (vfs_ioctl(filp, HOSHIKV_XTS_IOC_GET, (unsigned long)&d) >= 0) {
-			*status = d.value[0] ? 1 : 0;
-			rc = 0;
-		}
-	}
-
-	filp_close(filp, NULL);
-	return rc;
-}
+/*
+ * Notification-driven FOD capture, wired to libhoshikv:
+ *   - the fod_watch kthread is armed/stopped ONLY by
+ *     MI_DISP_IOCTL_SET_FOD_MODE (disp_feature_req.feature_val), mirroring
+ *     libhoshikv k()/v() -> fod_mode_set(fd, 1/0). No auto-arm at AOD entry and
+ *     no polling of /dev/xiaomi-touch mode 10.
+ *   - while armed the kthread is the SOLE reader of fod_press_status. Instead
+ *     of polling it injects a wait_queue_entry into the node's kernfs poll
+ *     waitqueue (via the file's ->poll()) so it wakes on each sysfs_notify.
+ *     touch driver calls notify_oneshot_sensor(FOD_PRESS, 1) on press and
+ *     (..., 0) on release, both followed by sysfs_notify, so each edge is
+ *     observed exactly once; the oneshot value is then consumed by a single
+ *     read. No touch driver patch, no symbol_request.
+ *   - press  -> mirror hoshikv_fod_state to 1 + sysfs_notify (lib
+ *               poll(POLLPRI) -> onFpTouch(true)), doze 120Hz + local HBM
+ *   - release -> mirror 0 + sysfs_notify (onFpTouch(false)), HBM off,
+ *               hold doze 120Hz until HOSHIKV_FOD_HOLD_MS then 30Hz
+ */
 
 /*
  * Protection: only inject HBM once the panel is actually parked in doze.
@@ -759,6 +743,17 @@ static int hoshikv_fod_force_fod_fps(struct disp_lhbm_fod *lhbm_fod)
 
 	DISP_INFO("hoshikv-fod: fod fps ready, rate=%d\n", rate);
 	return 0;
+}
+
+/* mirror the touch state to hoshikv_fod_state and poke the lib's poll. */
+static void hoshikv_fod_publish(struct disp_lhbm_fod *lhbm_fod, int on)
+{
+	struct device *dev = lhbm_fod->fod_sysdev;
+
+	atomic_set(&lhbm_fod->fod_press, !!on);
+	atomic_set(&lhbm_fod->fod_state_pub, !!on);
+	if (dev)
+		sysfs_notify(&dev->kobj, NULL, HOSHIKV_FOD_STATE_ATTR);
 }
 
 static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
@@ -818,45 +813,187 @@ static void hoshikv_fod_hold_tick(struct disp_lhbm_fod *lhbm_fod)
 	}
 }
 
+/* woken by the touch node's kernfs waitqueue (kernfs_notify -> wake_up). */
+static int hoshikv_fod_poll_wqfunc_entry(struct wait_queue_entry *entry,
+		unsigned int mode, int flags, void *key)
+{
+	struct disp_lhbm_fod *lhbm_fod = container_of(entry,
+			struct disp_lhbm_fod, fod_poll_entry);
+
+	atomic_set(&lhbm_fod->fod_poll_event, 1);
+	wake_up_interruptible(&lhbm_fod->fod_poll_wq);
+	return 0;
+}
+
+/*
+ * poll_table probed by the touch node's ->poll(). kernfs_fop_poll ->
+ * kernfs_generic_poll calls poll_wait(..., &on->poll, wait), handing us the
+ * node's waitqueue. We inject a single entry so our kthread is woken on each
+ * sysfs_notify instead of having to poll the value.
+ */
+static void hoshikv_fod_poll_qproc(struct file *fp,
+		wait_queue_head_t *wq, struct poll_table_struct *pt)
+{
+	struct disp_lhbm_fod *lhbm_fod = container_of(pt,
+			struct disp_lhbm_fod, fod_poll_pt);
+
+	if (!lhbm_fod->fod_poll_hooked && wq) {
+		lhbm_fod->fod_poll_parent = wq;
+		lhbm_fod->fod_poll_hooked = true;
+		add_wait_queue(wq, &lhbm_fod->fod_poll_entry);
+	}
+}
+
+static int hoshikv_fod_touch_open(struct disp_lhbm_fod *lhbm_fod)
+{
+	struct file *fp;
+
+	if (lhbm_fod->fod_touch_file)
+		return 0;
+
+	fp = filp_open(HOSHIKV_FOD_TOUCH_NODE, O_RDONLY, 0);
+	if (IS_ERR(fp)) {
+		DISP_INFO("hoshikv-fod: open %s failed (%ld)\n",
+				HOSHIKV_FOD_TOUCH_NODE, PTR_ERR(fp));
+		return PTR_ERR(fp);
+	}
+
+	lhbm_fod->fod_touch_file = fp;
+	lhbm_fod->fod_poll_hooked = false;
+	lhbm_fod->fod_poll_parent = NULL;
+	atomic_set(&lhbm_fod->fod_poll_event, 0);
+
+	/* register our entry + establish the of->event baseline */
+	if (fp->f_op && fp->f_op->poll)
+		fp->f_op->poll(fp, &lhbm_fod->fod_poll_pt);
+
+	DISP_INFO("hoshikv-fod: touch node opened\n");
+	return 0;
+}
+
+static void hoshikv_fod_touch_close(struct disp_lhbm_fod *lhbm_fod)
+{
+	struct file *fp = lhbm_fod->fod_touch_file;
+
+	if (!fp)
+		return;
+
+	/* drop our wq entry *before* fput so the kernfs waitqueue can vanish */
+	if (lhbm_fod->fod_poll_hooked && lhbm_fod->fod_poll_parent) {
+		remove_wait_queue(lhbm_fod->fod_poll_parent,
+				&lhbm_fod->fod_poll_entry);
+		lhbm_fod->fod_poll_hooked = false;
+		lhbm_fod->fod_poll_parent = NULL;
+	}
+	fput(fp);
+	lhbm_fod->fod_touch_file = NULL;
+	atomic_set(&lhbm_fod->fod_poll_event, 0);
+	DISP_INFO("hoshikv-fod: touch node closed\n");
+}
+
+/* consume the one-shot fod_press_status value (1 = pressed, 0 = released). */
+static int hoshikv_fod_touch_read(struct disp_lhbm_fod *lhbm_fod)
+{
+	struct file *fp = lhbm_fod->fod_touch_file;
+	char buf[8];
+	loff_t pos = 0;
+	ssize_t n;
+
+	if (!fp)
+		return 0;
+
+	fp->f_pos = 0;
+	n = kernel_read(fp, buf, sizeof(buf) - 1, &pos);
+	if (n <= 0) {
+		DISP_INFO("hoshikv-fod: touch read failed (%ld)\n", n);
+		return 0;
+	}
+
+	return (buf[0] == '1');
+}
+
 static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 {
 	struct disp_lhbm_fod *lhbm_fod = (struct disp_lhbm_fod *)arg;
-	int raw = 0;
+	int cur;
 
 	while (!kthread_should_stop()) {
+		/* parked; only a SET_FOD_MODE ioctl (enable) wakes us */
 		if (!atomic_read(&lhbm_fod->fod_watch_en)) {
-			lhbm_fod->fod_debounce = 0;
-			wait_event_interruptible_timeout(lhbm_fod->fod_watch_wq,
-					!atomic_read(&lhbm_fod->fod_watch_en),
-					msecs_to_jiffies(HOSHIKV_FOD_POLL_MS));
+			mutex_lock(&lhbm_fod->fod_touch_lock);
+			hoshikv_fod_touch_close(lhbm_fod);
+			mutex_unlock(&lhbm_fod->fod_touch_lock);
+
+			wait_event_interruptible(lhbm_fod->fod_watch_wq,
+					atomic_read(&lhbm_fod->fod_watch_en) ||
+					kthread_should_stop());
 			continue;
 		}
 
-		if (!hoshikv_fod_get_touch_status(&raw)) {
-			if (raw != lhbm_fod->fod_raw_last) {
-				lhbm_fod->fod_raw_last = raw;
-				lhbm_fod->fod_debounce = 0;
-			} else if (lhbm_fod->fod_debounce <
-					HOSHIKV_FOD_DEBOUNCE_N) {
-				lhbm_fod->fod_debounce++;
+		mutex_lock(&lhbm_fod->fod_touch_lock);
+		if (!lhbm_fod->fod_touch_file)
+			hoshikv_fod_touch_open(lhbm_fod);
+		mutex_unlock(&lhbm_fod->fod_touch_lock);
+
+		if (!lhbm_fod->fod_touch_file) {
+			/* touch node unavailable; back off and retry */
+			wait_event_interruptible_timeout(lhbm_fod->fod_watch_wq,
+					kthread_should_stop() ||
+					!atomic_read(&lhbm_fod->fod_watch_en),
+					msecs_to_jiffies(HOSHIKV_FOD_WAIT_MS));
+			continue;
+		}
+
+		/* consume any press that landed before the node was opened */
+		mutex_lock(&lhbm_fod->fod_touch_lock);
+		cur = hoshikv_fod_touch_read(lhbm_fod);
+		mutex_unlock(&lhbm_fod->fod_touch_lock);
+		if (cur) {
+			hoshikv_fod_publish(lhbm_fod, cur);
+			hoshikv_fod_press(lhbm_fod);
+		}
+
+		/* wait for press/release notifications on the touch node */
+		while (!kthread_should_stop() &&
+				atomic_read(&lhbm_fod->fod_watch_en)) {
+			__poll_t revents;
+
+			mutex_lock(&lhbm_fod->fod_touch_lock);
+			if (!lhbm_fod->fod_touch_file) {
+				mutex_unlock(&lhbm_fod->fod_touch_lock);
+				break;
 			}
 
-			if (lhbm_fod->fod_debounce >= HOSHIKV_FOD_DEBOUNCE_N &&
-				raw != atomic_read(&lhbm_fod->fod_press)) {
-				atomic_set(&lhbm_fod->fod_press, raw);
-				if (raw)
+			atomic_set(&lhbm_fod->fod_poll_event, 0);
+			revents = lhbm_fod->fod_touch_file->f_op->poll(
+					lhbm_fod->fod_touch_file,
+					&lhbm_fod->fod_poll_pt);
+			if (revents & (POLLPRI | POLLERR | POLLIN)) {
+				cur = hoshikv_fod_touch_read(lhbm_fod);
+				mutex_unlock(&lhbm_fod->fod_touch_lock);
+
+				hoshikv_fod_publish(lhbm_fod, cur);
+				if (cur)
 					hoshikv_fod_press(lhbm_fod);
 				else
 					hoshikv_fod_release(lhbm_fod);
-				/* keep userspace in sync either way */
-				mi_disp_lhbm_fod_watch_emit(
-					mi_get_disp_id(lhbm_fod->display->display_type),
-					raw);
+				break;
 			}
-		}
+			mutex_unlock(&lhbm_fod->fod_touch_lock);
 
-		hoshikv_fod_hold_tick(lhbm_fod);
-		msleep(HOSHIKV_FOD_POLL_MS);
+			hoshikv_fod_hold_tick(lhbm_fod);
+
+			wait_event_interruptible_timeout(lhbm_fod->fod_poll_wq,
+					kthread_should_stop() ||
+					!atomic_read(&lhbm_fod->fod_watch_en) ||
+					atomic_read(&lhbm_fod->fod_poll_event),
+					msecs_to_jiffies(
+						lhbm_fod->fod_hold_armed ?
+						HOSHIKV_FOD_HOLD_REARM_MS :
+						HOSHIKV_FOD_WAIT_MS));
+			if (!atomic_read(&lhbm_fod->fod_watch_en))
+				break;
+		}
 	}
 
 	return 0;
@@ -872,34 +1009,25 @@ int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id,
 		return -EINVAL;
 	}
 
-	atomic_set(&lhbm_fod->fod_watch_en, enable);
-	lhbm_fod->fod_debounce = 0;
-	lhbm_fod->fod_hold_armed = 0;
-
 	if (enable) {
+		atomic_set(&lhbm_fod->fod_watch_en, 1);
 		atomic_set(&lhbm_fod->fod_press, 0);
+		atomic_set(&lhbm_fod->fod_poll_event, 0);
+		lhbm_fod->fod_hold_armed = 0;
 		lhbm_fod->fod_fps_last_notify = jiffies;
 	} else {
+		atomic_set(&lhbm_fod->fod_watch_en, 0);
 		atomic_set(&lhbm_fod->fod_press, 0);
+		lhbm_fod->fod_hold_armed = 0;
 		mi_disp_set_local_hbm(disp_id,
 				LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);
-		mi_disp_lhbm_fod_watch_emit(disp_id, 0);
+		hoshikv_fod_publish(lhbm_fod, 0);
 	}
 
 	wake_up_interruptible(&lhbm_fod->fod_watch_wq);
+	wake_up_interruptible(&lhbm_fod->fod_poll_wq);
 	DISP_INFO("hoshikv-fod: watch %s\n", enable ? "enable" : "disable");
 	return 0;
-}
-
-void mi_disp_lhbm_fod_watch_emit(int disp_id, int on)
-{
-	struct disp_lhbm_fod *lhbm_fod = mi_get_disp_lhbm_fod(disp_id);
-
-	if (!lhbm_fod)
-		return;
-
-	atomic_set(&lhbm_fod->fod_state_pub, !!on);
-	DISP_INFO("hoshikv-fod: watch emit onFpTouch=%d\n", !!on);
 }
 
 int mi_disp_lhbm_fod_state_pub_get(int disp_id)
@@ -911,4 +1039,3 @@ int mi_disp_lhbm_fod_state_pub_get(int disp_id)
 
 	return atomic_read(&lhbm_fod->fod_state_pub);
 }
-
