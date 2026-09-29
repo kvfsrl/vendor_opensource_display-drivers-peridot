@@ -792,6 +792,19 @@ static void hoshikv_fod_publish(struct disp_lhbm_fod *lhbm_fod, int on)
 		sysfs_notify(&dev->kobj, NULL, HOSHIKV_FOD_STATE_ATTR);
 }
 
+/* mirror the lib's hbm_on(): pull DC dimming off so it can't grey the HBM
+ * region during fingerprint capture. no-op unless the panel has DC enabled. */
+static int hoshikv_fod_set_dc(struct disp_lhbm_fod *lhbm_fod, bool on)
+{
+	struct disp_feature_ctl ctl;
+	struct dsi_panel *panel = lhbm_fod->display->panel;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.feature_id = DISP_FEATURE_DC;
+	ctl.feature_val = on ? FEATURE_ON : FEATURE_OFF;
+	return mi_dsi_panel_set_disp_param(panel, &ctl);
+}
+
 static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
 {
 	struct dsi_display *display = lhbm_fod->display;
@@ -805,11 +818,18 @@ static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
 	in_doze = (panel->power_mode == SDE_MODE_DPMS_LP1 ||
 		   panel->power_mode == SDE_MODE_DPMS_LP2);
 
-	if (in_doze) {
-		/* route to doze 120Hz *before* the HBM goes on */
-		if (hoshikv_fod_force_fod_fps(lhbm_fod))
-			DISP_INFO("hoshikv-fod: injecting HBM without confirmed fod fps\n");
+	if (panel->mi_cfg.dc_feature_enable &&
+	    panel->mi_cfg.feature_val[DISP_FEATURE_DC] == FEATURE_ON) {
+		if (!hoshikv_fod_set_dc(lhbm_fod, false))
+			lhbm_fod->fod_dc_restore = 1;
+	}
 
+	/* request the FOD rate *before* HBM latches (HAL handshake) in doze AND
+	 * awake - same NEED_UPDATE_TO_FOD_FPS the old lib relied on for auth */
+	if (hoshikv_fod_force_fod_fps(lhbm_fod))
+		DISP_INFO("hoshikv-fod: injecting HBM without confirmed fod fps\n");
+
+	if (in_doze) {
 		/* (re)start the 3s hold so back-to-back touches keep doze at 120Hz */
 		lhbm_fod->fod_hold_deadline =
 			jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
@@ -822,13 +842,27 @@ static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
 
 static void hoshikv_fod_release(struct disp_lhbm_fod *lhbm_fod)
 {
+	struct dsi_panel *panel = lhbm_fod->display->panel;
 	int disp_id = mi_get_disp_id(lhbm_fod->display->display_type);
+	bool in_doze;
 
 	/* HBM off, but keep doze at 120Hz until the hold expires */
 	lhbm_fod->fod_hold_deadline =
 		jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
 	lhbm_fod->fod_hold_armed = 1;
 	lhbm_fod->fod_fps_best_effort = 0;
+
+	in_doze = (panel->power_mode == SDE_MODE_DPMS_LP1 ||
+		   panel->power_mode == SDE_MODE_DPMS_LP2);
+
+	if (lhbm_fod->fod_dc_restore) {
+		hoshikv_fod_set_dc(lhbm_fod, true);
+		lhbm_fod->fod_dc_restore = 0;
+	}
+
+	/* awake: hand the FOD rate back immediately (doze falls back via hold) */
+	if (!in_doze)
+		mi_disp_lhbm_fod_event_notify(lhbm_fod, FOD_EVENT_UP);
 
 	DISP_INFO("hoshikv-fod: release detected\n");
 	mi_disp_set_local_hbm(disp_id, LHBM_TARGET_BRIGHTNESS_OFF_FINGER_UP);

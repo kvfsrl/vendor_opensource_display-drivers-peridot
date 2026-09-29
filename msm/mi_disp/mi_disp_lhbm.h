@@ -106,8 +106,9 @@ struct disp_lhbm_fod {
 	int fod_hold_armed;
 	unsigned long fod_hold_deadline;
 	unsigned long fod_fps_last_notify;
-	int fod_fps_best_effort;	/* 1 = HAL didn't land 120Hz, inject HBM anyway */
-};
+int fod_fps_best_effort;	/* 1 = HAL didn't land 120Hz, inject HBM anyway */
+	int fod_dc_restore;		/* 1 = DC pulled off for HBM, restore on release */
+  };
 
 struct lhbm_setting {
 	int lhbm_value;
