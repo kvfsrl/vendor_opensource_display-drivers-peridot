@@ -694,8 +694,10 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
  *     MI_DISP_IOCTL_SET_FOD_MODE (disp_feature_req.feature_val), mirroring
  *     libhoshikv k()/v(). No auto-arm at AOD entry and no polling of
  *     /dev/xiaomi-touch mode 10.
- *   - SET_FOD_MODE on == forced press: HBM on immediately (even with the
- *     screen awake, where the touch driver drops FOD events) and state=1.
+ *   - SET_FOD_MODE on == forced press: HBM on + state=1, but ONLY while
+ *     the screen is fully awake (the touch driver drops FOD events awake).
+ *     In doze/OFF the arm never lights HBM; the touch watcher below is the
+ *     sole trigger there, reacting to real fod_press_status edges only.
  *   - SET_FOD_MODE off == release: HBM off and state=0.
  *   - while armed the kthread is the SOLE reader of fod_press_status. Instead
  *     of polling it injects a wait_queue_entry into the node's kernfs poll
@@ -738,6 +740,13 @@ static bool hoshikv_fod_panel_stable(struct dsi_panel *panel)
 	}
 
 	return true;
+}
+
+/* only a fully-awake screen may take the ioctl-driven forced press. */
+static bool hoshikv_fod_awake(struct dsi_panel *panel)
+{
+	return panel && dsi_panel_initialized(panel) &&
+		panel->power_mode == SDE_MODE_DPMS_ON;
 }
 
 /* doze 30Hz -> doze 120Hz: ask HAL, then wait for the rate to land. */
@@ -983,7 +992,7 @@ static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 		mutex_lock(&lhbm_fod->fod_touch_lock);
 		cur = hoshikv_fod_touch_read(lhbm_fod);
 		mutex_unlock(&lhbm_fod->fod_touch_lock);
-		if (cur) {
+		if (cur && hoshikv_fod_awake(lhbm_fod->display->panel)) {
 			hoshikv_fod_publish(lhbm_fod, cur);
 			hoshikv_fod_press(lhbm_fod);
 		}
@@ -1056,11 +1065,18 @@ int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id,
 		lhbm_fod->fod_fps_last_notify = jiffies;
 		lhbm_fod->fod_fps_best_effort = 0;
 
-		/* SET_FOD_MODE on == forced press: light HBM immediately (works
-		 * awake, where the touch driver drops FOD events, and in doze)
-		 * and mirror hoshikv_fod_state for the lib's poll */
-		hoshikv_fod_press(lhbm_fod);
-		hoshikv_fod_publish(lhbm_fod, 1);
+		/* SET_FOD_MODE on == forced press, but ONLY while the screen is
+		 * fully awake. In doze/OFF the touch->fod_press_status watcher is
+		 * the sole HBM source, so a session arm can never light the FOD by
+		 * itself when the screen is off/transitioning. */
+		if (hoshikv_fod_awake(lhbm_fod->display->panel)) {
+			hoshikv_fod_press(lhbm_fod);
+			hoshikv_fod_publish(lhbm_fod, 1);
+		} else {
+			DISP_INFO("hoshikv-fod: screen not awake, "
+				"deferring HBM to the touch watcher\n");
+			hoshikv_fod_publish(lhbm_fod, 0);
+		}
 	} else {
 		atomic_set(&lhbm_fod->fod_watch_en, 0);
 		atomic_set(&lhbm_fod->fod_press, 0);
