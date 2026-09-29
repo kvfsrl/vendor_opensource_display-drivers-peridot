@@ -1003,6 +1003,32 @@ int mi_dsi_display_get_fps(void *display, struct disp_fps_info *fps_info)
 	return ret;
 }
 
+/*
+ * hoshikv: inner body of the doze brightness set. Caller must already hold
+ * dsi_display->panel->mi_cfg.doze_lock (the public wrapper takes it; the doze
+ * ensure/drop paths inside dsi_display_set_power run with it held already).
+ * sde_vm_lock is NOT taken here to avoid a nested-vm deadlock on the dpms path.
+ */
+static int mi_dsi_display_set_doze_brightness_locked(struct dsi_display *dsi_display,
+			u32 doze_brightness)
+{
+	int ret;
+
+	if (sde_kms_is_suspend_blocked(dsi_display->drm_dev)) {
+		DISP_ERROR("sde_kms is suspended, skip to set doze brightness\n");
+		return -EBUSY;
+	}
+
+	mi_dsi_acquire_wakelock(dsi_display->panel);
+	SDE_ATRACE_BEGIN("set_doze_brightness");
+	ret = mi_dsi_panel_set_doze_brightness(dsi_display->panel,
+				doze_brightness);
+	SDE_ATRACE_END("set_doze_brightness");
+	mi_dsi_release_wakelock(dsi_display->panel);
+
+	return ret;
+}
+
 int mi_dsi_display_set_doze_brightness(void *display,
 			u32 doze_brightness)
 {
@@ -1034,14 +1060,10 @@ int mi_dsi_display_set_doze_brightness(void *display,
 		goto end;
 	}
 
-	mi_dsi_acquire_wakelock(dsi_display->panel);
 	mutex_lock(&dsi_display->panel->mi_cfg.doze_lock);
-	SDE_ATRACE_BEGIN("set_doze_brightness");
-	ret = mi_dsi_panel_set_doze_brightness(dsi_display->panel,
+	ret = mi_dsi_display_set_doze_brightness_locked(dsi_display,
 				doze_brightness);
-	SDE_ATRACE_END("set_doze_brightness");
 	mutex_unlock(&dsi_display->panel->mi_cfg.doze_lock);
-	mi_dsi_release_wakelock(dsi_display->panel);
 
 	disp_id = mi_get_disp_id(dsi_display->display_type);
 	mi_disp_feature_event_notify_by_type(disp_id, MI_DISP_EVENT_DOZE,
@@ -1565,7 +1587,7 @@ MODULE_PARM_DESC(debugpolicy, "msm_drm.debugpolicy=<debug policy> to indicate su
  *   drop()   - clear it again as soon as the AOD surface is gone (aod2normal,
  *              screen on, or FOD finished) so no doze state is left behind.
  */
-void mi_dsi_hoshikv_doze_ensure(struct dsi_display *display)
+void mi_dsi_hoshikv_doze_ensure_locked(struct dsi_display *display)
 {
 	u32 cur = 0;
 	int rc;
@@ -1586,12 +1608,12 @@ void mi_dsi_hoshikv_doze_ensure(struct dsi_display *display)
 	if (!rc && cur == DOZE_BRIGHTNESS_HBM)
 		return;
 
-	rc = mi_dsi_display_set_doze_brightness(display,
+	rc = mi_dsi_display_set_doze_brightness_locked(display,
 			DOZE_BRIGHTNESS_HBM);
 	DISP_INFO("hoshikv-doze2: arm doze HBM, rc=%d\n", rc);
 }
 
-void mi_dsi_hoshikv_doze_drop(struct dsi_display *display)
+void mi_dsi_hoshikv_doze_drop_locked(struct dsi_display *display)
 {
 	u32 cur = 0;
 
@@ -1609,5 +1631,25 @@ void mi_dsi_hoshikv_doze_drop(struct dsi_display *display)
 		return;
 
 	DISP_INFO("hoshikv-doze2: drop doze brightness to normal\n");
-	mi_dsi_display_set_doze_brightness(display, DOZE_TO_NORMAL);
+	mi_dsi_display_set_doze_brightness_locked(display, DOZE_TO_NORMAL);
+}
+
+void mi_dsi_hoshikv_doze_ensure(struct dsi_display *display)
+{
+	if (!display || !display->panel)
+		return;
+
+	mutex_lock(&display->panel->mi_cfg.doze_lock);
+	mi_dsi_hoshikv_doze_ensure_locked(display);
+	mutex_unlock(&display->panel->mi_cfg.doze_lock);
+}
+
+void mi_dsi_hoshikv_doze_drop(struct dsi_display *display)
+{
+	if (!display || !display->panel)
+		return;
+
+	mutex_lock(&display->panel->mi_cfg.doze_lock);
+	mi_dsi_hoshikv_doze_drop_locked(display);
+	mutex_unlock(&display->panel->mi_cfg.doze_lock);
 }
