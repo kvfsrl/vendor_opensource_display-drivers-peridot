@@ -701,6 +701,7 @@ int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
  *               hold doze 120Hz until HOSHIKV_FOD_HOLD_MS then 30Hz
  *   - the watcher only acts on value transitions and always sleeps between
  *     reads, so nodes that keep poll() ready forever cannot busy-loop it.
+ */
 
 /*
  * Protection: only inject HBM once the panel is actually parked in doze.
