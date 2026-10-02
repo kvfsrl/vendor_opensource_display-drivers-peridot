@@ -145,7 +145,12 @@ int mi_disp_lhbm_aod_to_normal_optimize(struct dsi_display *display,
 int mi_disp_set_local_hbm(int disp_id, int lhbm_value);
 int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id, bool enable);
 int mi_disp_lhbm_fod_state_pub_get(int disp_id);
-void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display);
+/*
+ * keep_fod: true when this DPMS transition belongs to an in-flight FOD touch
+ * (doze->normal walk), so the 3s doze-120Hz hold must survive it.
+ */
+void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display,
+		bool keep_fod);
 bool mi_disp_lhbm_fod_nolp_active(struct dsi_panel *panel);
 bool mi_disp_lhbm_fod_sdm_doze_active(struct dsi_display *display);
 int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,

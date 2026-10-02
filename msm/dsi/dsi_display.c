@@ -1495,8 +1495,11 @@ int dsi_display_set_power(struct drm_connector *connector,
 #ifdef MI_DISPLAY_MODIFY
 		/* hoshikv: a FOD press may own doze NOLP (power_mode faked to
 		 * DPMS_ON by dsi_panel_set_nolp). The dpms path takes the panel
-		 * over from here, so drop that bookkeeping first. */
-		mi_disp_lhbm_fod_doze_nolp_abort(display);
+		 * over from here, so drop that bookkeeping first -- but keep the
+		 * 3s doze-120Hz hold: this transition IS the FOD doze->normal walk,
+		 * not a screen-off, and cancelling it here killed doze 120Hz ~40ms
+		 * after the panel reached it. */
+		mi_disp_lhbm_fod_doze_nolp_abort(display, true);
 		mi_dsi_hoshikv_doze_drop_locked(display);
 		if (mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PA ||
 			mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PB) {
@@ -1526,8 +1529,9 @@ int dsi_display_set_power(struct drm_connector *connector,
 			pm_relax(&display->pdev->dev);
 		}
 
-		/* hoshikv: drop the FOD doze NOLP ownership, the panel goes off */
-		mi_disp_lhbm_fod_doze_nolp_abort(display);
+		/* hoshikv: drop the FOD doze NOLP ownership, the panel goes off. This is a
+		 * real screen-off, so the hold must die with it. */
+		mi_disp_lhbm_fod_doze_nolp_abort(display, false);
 
 		if (mi_disp_lhbm_fod_enabled(display->panel))
 			mi_disp_lhbm_fod_allow_tx_lhbm(display, false);

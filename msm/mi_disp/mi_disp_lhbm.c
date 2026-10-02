@@ -1103,8 +1103,14 @@ static void hoshikv_fod_doze_nolp_leave(struct disp_lhbm_fod *lhbm_fod)
 /*
  * The DPMS path owns the panel when the screen really turns on/off: just drop
  * the NOLP bookkeeping, never send LP tx from here.
+ *
+ * hoshikv: keep_fod=true when this transition belongs to an in-flight FOD touch
+ * (the doze->normal walk SDM does for a press). It is NOT a screen-off, so the
+ * 3s doze-120Hz hold must survive it. Only a real DPMS_ON/OFF hands the panel
+ * back and may cancel the hold.
  */
-void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display)
+void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display,
+		bool keep_fod)
 {
 	struct disp_lhbm_fod *lhbm_fod;
 	struct dsi_panel *panel;
@@ -1130,12 +1136,30 @@ void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display)
 	if (!lhbm_fod->fod_nolp_on && !lhbm_fod->fod_sdm_doze)
 		return;
 
+	/*
+	 * hoshikv: this used to tear the hold down unconditionally, and the
+	 * FOD doze->normal DPMS walk fired it ~40ms after the panel went to 120Hz,
+	 * so doze 120Hz never lasted longer than that. Keep the hold (and the
+	 * timer) while a FOD touch is still live; only drop the NOLP flags.
+	 */
+	if (keep_fod && atomic_read(&lhbm_fod->fod_watch_en) &&
+	    lhbm_fod->fod_hold_armed &&
+	    time_before(jiffies, lhbm_fod->fod_hold_deadline)) {
+		lhbm_fod->fod_nolp_on = 0;
+		lhbm_fod->fod_nolp_prev_mode = 0;
+		DISP_INFO("hoshikv-fod: dpms during FOD hold, keeping doze 120Hz"
+			" (left=%ums)\n",
+			jiffies_to_msecs(lhbm_fod->fod_hold_deadline -
+				jiffies));
+		return;
+	}
+
 	lhbm_fod->fod_nolp_on = 0;
 	lhbm_fod->fod_nolp_prev_mode = 0;
 	lhbm_fod->fod_hold_armed = 0;
 	lhbm_fod->fod_sdm_doze = 0;
 	/* the real power path owns the panel from here; drop the vendor
-	 * aod->normal flag too or dsi_panel_set_lp2() would keep skipping */
+	 * aod_to_normal flag too or dsi_panel_set_lp2() would keep skipping */
 	panel->mi_cfg.aod_to_normal_statue = false;
 	/* no async release: this runs under mi_cfg.doze_lock from the DPMS
 	 * transition, and the worker would race it back into doze */
