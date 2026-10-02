@@ -5119,6 +5119,21 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 	if (!panel->panel_initialized)
 		goto exit;
 
+#ifdef MI_DISPLAY_MODIFY
+	/* set_lp2 already refuses to drag the panel back into lp while aod or a
+	 * doze fingerprint owns it, lp1 had no such guard. The doze power
+	 * transition (hal set_power(Doze)) races the fingerprint press: when
+	 * lp1 lands after the press already sent the nolp command set, the panel
+	 * goes back to lp under the running fingerprint ui and renders grey.
+	 * dsi_display_set_power() still records power_mode, only the link state
+	 * is left alone here. */
+	if (panel->mi_cfg.aod_to_normal_statue == true ||
+	    mi_disp_lhbm_fod_nolp_active(panel)) {
+		DSI_INFO("fod owns the panel, skip set DSI_CMD_SET_LP1\n");
+		goto exit;
+	}
+#endif
+
 	/*
 	 * Consider LP1->LP2->LP1.
 	 * If the panel is already in LP mode, do not need to
@@ -6028,10 +6043,20 @@ int dsi_panel_video_mode_post_aod_locked(struct dsi_panel *panel)
 		return rc;
 	}
 
+	/* hoshikv: a doze fingerprint is driving the panel in normal mode gamma
+	 * (mi_dsi_panel_fod_aod_switch_locked). A doze commit landing here would
+	 * push the panel back into the aod gamma underneath it, which shows up
+	 * as a random grey flash while the finger is still down. */
+	if (mi_disp_lhbm_fod_nolp_active(panel)) {
+		DSI_DEBUG("Fod doze ui active, skip aod enter");
+		panel->mi_cfg.aod_enter_flags = false;
+		return rc;
+	}
+
 	if (panel->cur_mode->timing.refresh_rate == 30 &&
 		panel->mi_cfg.aod_enter_flags &&
 		(panel->power_mode == SDE_MODE_DPMS_LP1 ||
-		panel->power_mode == SDE_MODE_DPMS_LP2)){
+		panel->power_mode == SDE_MODE_DPMS_LP2)	){
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_AOD_ENTER);
 		panel->mi_cfg.aod_enter_flags = false;
 		DISP_TIME_INFO("%s panel-enter aod: cur_fps = %d, "

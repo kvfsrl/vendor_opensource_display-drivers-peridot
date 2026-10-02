@@ -31,6 +31,7 @@ struct disp_feature_client {
 	struct mutex event_lock;
 	struct mutex client_lock;
 	u32 event_space;
+	u32 read_pos;
 };
 
 typedef int disp_ioctl_func_t(struct disp_feature_client *, void *data);

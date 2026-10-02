@@ -1622,6 +1622,99 @@ exit:
 	return rc;
 }
 
+/*
+ * hoshikv: OUR OWN doze 30/120 switch for FOD. Sends the panel DOZE_HBM /
+ * DOZE_LBM DSI command directly - the same command family Xiaomi's
+ * doze_brightness ioctl uses - but driven from the FOD thread at our own
+ * times, completely outside the Xiaomi doze_brightness ioctl/workqueue/HAL
+ * event path.
+ */
+int mi_dsi_panel_hoshikv_doze_fps(struct dsi_panel *panel, bool to_fod)
+{
+	struct mi_dsi_panel_cfg *mi_cfg;
+	int rc = 0;
+
+	if (!panel) {
+		DISP_ERROR("invalid params\n");
+		return -EINVAL;
+	}
+
+	if (panel->power_mode != SDE_MODE_DPMS_LP1 &&
+	    panel->power_mode != SDE_MODE_DPMS_LP2)
+		return -EINVAL;
+
+	mutex_lock(&panel->panel_lock);
+
+	if (!dsi_panel_initialized(panel)) {
+		DISP_ERROR("panel is not initialized!\n");
+		rc = -EINVAL;
+		goto exit;
+	}
+
+	mi_cfg = &panel->mi_cfg;
+
+	if (is_hbm_fod_on(panel)) {
+		/* FOD HBM region is live: the doze depth must not fight it */
+		DISP_INFO("[%s] hoshikv: skip doze fps, FOD HBM on\n",
+				panel->type);
+		rc = -EBUSY;
+		goto exit;
+	}
+
+	if (to_fod) {
+		if (mi_cfg->doze_brightness == DOZE_BRIGHTNESS_HBM)
+			goto exit;
+
+		mi_cfg->panel_state = PANEL_STATE_DOZE_HIGH;
+		if (mi_get_panel_id_by_dsi_panel(panel) == N16T_PANEL_PB) {
+			if (panel->cur_mode->timing.refresh_rate == 30)
+				mi_dsi_update_51_mipi_cmd(panel,
+						DSI_CMD_SET_MI_DOZE_HBM, 1023);
+			else
+				mi_dsi_update_51_mipi_cmd(panel,
+						DSI_CMD_SET_MI_DOZE_HBM,
+						mi_cfg->doze_hbm_dbv_level);
+			mi_cfg->last_aod_state = DOZE_BRIGHTNESS_HBM;
+		}
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_DOZE_HBM);
+		if (rc)
+			DISP_ERROR("[%s] failed to send DOZE_HBM cmd, rc=%d\n",
+					panel->type, rc);
+	} else {
+		if (mi_cfg->doze_brightness == DOZE_BRIGHTNESS_LBM)
+			goto exit;
+
+		mi_cfg->panel_state = PANEL_STATE_DOZE_LOW;
+		if (mi_get_panel_id_by_dsi_panel(panel) == N16T_PANEL_PB) {
+			if (panel->cur_mode->timing.refresh_rate == 30)
+				mi_dsi_update_51_mipi_cmd(panel,
+						DSI_CMD_SET_MI_DOZE_LBM, 511);
+			else
+				mi_dsi_update_51_mipi_cmd(panel,
+						DSI_CMD_SET_MI_DOZE_LBM,
+						mi_cfg->doze_lbm_dbv_level);
+			mi_cfg->last_aod_state = DOZE_BRIGHTNESS_LBM;
+		}
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_DOZE_LBM);
+		if (rc)
+			DISP_ERROR("[%s] failed to send DOZE_LBM cmd, rc=%d\n",
+					panel->type, rc);
+	}
+
+	if (!rc) {
+		mi_cfg->last_doze_brightness = mi_cfg->doze_brightness;
+		mi_cfg->doze_brightness = to_fod ? DOZE_BRIGHTNESS_HBM
+						 : DOZE_BRIGHTNESS_LBM;
+		DISP_INFO("[%s] hoshikv doze fps -> %s\n", panel->type,
+				to_fod ? "DOZE_HBM(120Hz)" : "DOZE_LBM(30Hz)");
+	}
+
+exit:
+	mutex_unlock(&panel->panel_lock);
+
+	return rc;
+}
+
 int mi_dsi_panel_get_doze_brightness(struct dsi_panel *panel,
 			u32 *doze_brightness)
 {
@@ -5393,6 +5486,300 @@ int mi_dsi_panel_gamma_switch_n16t_PB(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_MI_AOD cmds, rc=%d\n",
 				panel->name, rc);
+
+	return rc;
+}
+
+bool mi_disp_lhbm_fod_nolp_active(struct dsi_panel *panel)
+{
+	struct disp_lhbm_fod *lhbm_fod;
+
+	if (!panel || panel->power_mode == SDE_MODE_DPMS_OFF)
+		return false;
+
+	lhbm_fod = mi_get_disp_lhbm_fod(MI_DISP_PRIMARY);	if (!lhbm_fod)
+		return false;
+
+	return lhbm_fod->fod_nolp_on && dsi_panel_initialized(panel);
+}
+
+/*
+ * The stock 30 -> non-30 vr commit always lands the aod exit and the fps gamma
+ * back to back (dsi_panel_video_mode_pre_aod_locked() then
+ * dsi_panel_gamma_switch_locked() in sde_encoder.c): 0x38, then 0x2f <fps>.
+ * Skipping the 0x2f leaves the panel scanning out the fingerprint ui through
+ * the aod gamma curve, which reads as a green cast over the whole surface.
+ *
+ * The doze fingerprint has no commit to carry it, so send the gamma here. The
+ * panel runs at the full rate it was parked at (120) while the doze ui is up.
+ */
+int mi_dsi_panel_fod_gamma_locked(struct dsi_panel *panel)
+{
+	int rc;
+
+	if (!panel || !panel->cur_mode) {
+		DISP_ERROR("invalid params\n");
+		return -EINVAL;
+	}
+
+	if (!panel->panel_initialized)
+		return -EINVAL;
+
+	if (!panel->mi_cfg.need_fod_animal_in_normal)
+		return -ENOTSUPP;
+
+	/* PB builds its own gamma table per fps, PA only has the 2f register */
+	if (mi_get_panel_id_by_dsi_panel(panel) == N16T_PANEL_PB)
+		return -ENOTSUPP;
+
+	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_FPS_120_GAMMA);
+	DISP_TIME_INFO("%s fod gamma -> 120Hz profile (live fps=%d), rc=%d\n",
+		panel->type, panel->cur_mode->timing.refresh_rate, rc);
+
+	return rc;
+}
+
+/*
+ * Replay one dcs register out of an already parsed command set.
+ *
+ * The descriptor is copied out of the dt packet so the msg type, channel and
+ * flags are whatever the vendor asked for, but the payload is rebuilt on the
+ * stack: the parsed tx_buf is shared with the real command set and must not be
+ * written through.
+ */
+static int mi_dsi_panel_replay_dcs(struct dsi_panel *panel,
+		struct dsi_cmd_desc *dst, enum dsi_cmd_set_type type, u8 dcs, u8 arg)
+{
+	struct dsi_display_mode *mode = panel->cur_mode;
+	struct dsi_cmd_desc *cmds;
+	u8 *tx_buf;
+	u8 buf[2] = { dcs, arg };
+	u32 count;
+	u32 i;
+
+	if (!mode || !mode->priv_info)
+		return -EINVAL;
+
+	cmds = mode->priv_info->cmd_sets[type].cmds;
+	count = mode->priv_info->cmd_sets[type].count;
+
+	for (i = 0; i < count; i++) {
+		tx_buf = (u8 *)cmds[i].msg.tx_buf;
+		if (!tx_buf || tx_buf[0] != dcs || cmds[i].msg.tx_len < 2)
+			continue;
+
+		*dst = cmds[i];
+		dst->msg.tx_buf = buf;
+		dst->msg.tx_len = sizeof(buf);
+		dst->ctrl_flags = 0;
+		dst->post_wait_ms = 0;
+		return 0;
+	}
+
+	DISP_ERROR("%s fod: dcs 0x%02x not in cmd set %d\n",
+		panel->type, dcs, type);
+	return -ENOENT;
+}
+
+/*
+ * Run the whole fod enter sequence as one pipelined burst.
+ *
+ * A standalone dsi transfer costs about a frame while the panel is parked in
+ * doze, ~33ms at 30Hz, because dsi_ctrl_transfer_unprepare() parks in
+ * dsi_ctrl_dma_cmd_wait_for_done() for every packet flagged
+ * DSI_CTRL_CMD_LAST_COMMAND - which is every packet in these small command
+ * sets, since dt does not batch them. Firing the five packets the enter path
+ * needs that way (0x38, 2f 00, 26 00, 5f 00 40, 51 00 f5) left the aod already
+ * exited for ~130ms, which reads as doze blinking black before the hbm lands.
+ *
+ * The panel's own wake sets batch the burst instead - every packet but the
+ * last is MIPI_DSI_MSG_BATCH_COMMAND, so the controller holds the hs link
+ * across them and reports done once. 51 00 f5 is left unbatched so we still
+ * wait for the panel to have taken the whole sequence before the hbm goes on.
+ */
+int mi_dsi_panel_fod_nolp_enter_locked(struct dsi_panel *panel)
+{
+	struct dsi_display_mode *mode;
+	struct dsi_cmd_desc dsc;
+	struct dsi_panel_cmd_set *aod_exit, *gamma, *nolp;
+	int rc = 0;
+	ssize_t len;
+
+	if (!panel || !panel->cur_mode || !panel->panel_initialized)
+		return -EINVAL;
+
+	mode = panel->cur_mode;
+	if (!mode->priv_info)
+		return -EINVAL;
+
+	aod_exit = &mode->priv_info->cmd_sets[DSI_CMD_SET_MI_AOD_EXIT];
+	gamma = &mode->priv_info->cmd_sets[DSI_CMD_SET_MI_FPS_120_GAMMA];
+	nolp = &mode->priv_info->cmd_sets[DSI_CMD_SET_MI_DOZE_HBM_NOLP];
+
+	if (aod_exit->count < 1 || gamma->count < 1 || nolp->count < 2) {
+		DISP_ERROR("%s fod: missing aod/gamma/nolp command sets\n",
+			panel->type);
+		return -EINVAL;
+	}
+
+	dsc = aod_exit->cmds[0];
+	dsc.msg.flags |= MIPI_DSI_MSG_BATCH_COMMAND;
+	dsc.last_command = false;
+	dsc.ctrl_flags = 0;
+	dsc.post_wait_ms = 0;
+	len = dsi_host_transfer_sub(panel->host, &dsc);
+	if (len < 0) {
+		DISP_ERROR("%s fod: aod exit tx failed, rc=%zd\n",
+			panel->type, len);
+		return len;
+	}
+
+	dsc = gamma->cmds[0];
+	dsc.msg.flags |= MIPI_DSI_MSG_BATCH_COMMAND;
+	dsc.last_command = false;
+	dsc.ctrl_flags = 0;
+	dsc.post_wait_ms = 0;
+	len = dsi_host_transfer_sub(panel->host, &dsc);
+	if (len < 0) {
+		DISP_ERROR("%s fod: gamma tx failed, rc=%zd\n",
+			panel->type, len);
+		return len;
+	}
+
+	rc = mi_dsi_panel_replay_dcs(panel, &dsc, DSI_CMD_SET_ON, 0x26, 0x00);
+	if (rc)
+		return rc;
+	dsc.msg.flags |= MIPI_DSI_MSG_BATCH_COMMAND;
+	dsc.last_command = false;
+	len = dsi_host_transfer_sub(panel->host, &dsc);
+	if (len < 0) {
+		DISP_ERROR("%s fod: colour mode tx failed, rc=%zd\n",
+			panel->type, len);
+		return len;
+	}
+
+	dsc = nolp->cmds[0];
+	dsc.msg.flags |= MIPI_DSI_MSG_BATCH_COMMAND;
+	dsc.last_command = false;
+	dsc.ctrl_flags = 0;
+	dsc.post_wait_ms = 0;
+	len = dsi_host_transfer_sub(panel->host, &dsc);
+	if (len < 0) {
+		DISP_ERROR("%s fod: nolp tx failed, rc=%zd\n",
+			panel->type, len);
+		return len;
+	}
+
+	/* last packet of the burst: this is the one that waits */
+	dsc = nolp->cmds[1];
+	dsc.last_command = true;
+	dsc.ctrl_flags = 0;
+	dsc.post_wait_ms = 0;
+	len = dsi_host_transfer_sub(panel->host, &dsc);
+	if (len < 0) {
+		DISP_ERROR("%s fod: nolp backlight tx failed, rc=%zd\n",
+			panel->type, len);
+		return len;
+	}
+
+	/* mirrors what mi_dsi_panel_aod_to_normal_optimize_locked() records, so
+	 * the caller can keep checking aod_to_normal_statue to confirm we left
+	 * lp without it having to run the set again. */
+	panel->mi_cfg.panel_state = PANEL_STATE_ON;
+	panel->mi_cfg.aod_to_normal_statue = true;
+
+	DISP_TIME_INFO("%s fod normal mode (batched 2f/26/5f/51), rc=%d\n",
+		panel->type, rc);
+
+	return 0;
+}
+
+/*
+ * aod <-> normal mode doze, without a mode change. Entering doze sends
+ * DSI_CMD_SET_MI_AOD_ENTER (0x39), which puts the panel in the aod gamma; the
+ * matching DSI_CMD_SET_MI_AOD_EXIT (0x38) is the way back. The stock path only
+ * reaches it through dsi_panel_video_mode_pre/post_aod_locked(), gated on a
+ * 30 -> non-30 atomic commit, so a doze fingerprint that leaves lp for the
+ * capture but keeps the 30hz doze mode would stay driven by the aod gamma and
+ * render grey.
+ *
+ * aod_enter=false leaves aod (for a full rate doze ui), aod_enter=true goes
+ * back. The 0x51 dbv is not part of these command sets, the caller moves it
+ * with the doze hbm/lbm commands.
+ */
+int mi_dsi_panel_fod_aod_switch_locked(struct dsi_panel *panel, bool aod_enter)
+{
+	int rc = 0;
+	int update_bl = 0;
+	u32 doze_brightness;
+
+	if (!panel || !panel->cur_mode) {
+		DISP_ERROR("invalid params\n");
+		return -EINVAL;
+	}
+
+	if (!panel->panel_initialized) {
+		DISP_ERROR("panel_initialized fail\n");
+		return -EINVAL;
+	}
+
+	/* N16T PA and PB both have the aod enter/exit command sets, so both
+	 * accept the 0x51 dbv patch applied below. */
+	if (mi_get_panel_id_by_dsi_panel(panel) != N16T_PANEL_PB &&
+	    mi_get_panel_id_by_dsi_panel(panel) != N16T_PANEL_PA)
+		return -ENOTSUPP;
+
+	/* both directions need the panel back in the doze link, sde only knows
+	 * about lp here because nobody committed a non-30 mode */
+	if (panel->power_mode != SDE_MODE_DPMS_LP1 &&
+	    panel->power_mode != SDE_MODE_DPMS_LP2)
+		return 0;
+
+	if (!aod_enter && panel->mi_cfg.panel_state != PANEL_STATE_DOZE_HIGH &&
+	    panel->mi_cfg.panel_state != PANEL_STATE_DOZE_LOW) {
+		/* not in aod, nothing to leave */
+		return 0;
+	}
+
+	doze_brightness = panel->mi_cfg.doze_brightness;
+	if (doze_brightness == DOZE_TO_NORMAL)
+		doze_brightness = panel->mi_cfg.last_doze_brightness;
+
+	switch (doze_brightness) {
+	case DOZE_BRIGHTNESS_HBM:
+		update_bl = aod_enter ? 1023 : panel->mi_cfg.doze_hbm_dbv_level;
+		break;
+	case DOZE_BRIGHTNESS_LBM:
+		update_bl = aod_enter ? 511 : panel->mi_cfg.doze_lbm_dbv_level;
+		break;
+	default:
+		break;
+	}
+
+	if (mi_get_panel_id_by_dsi_panel(panel) == N16T_PANEL_PB)
+		mi_dsi_update_aod_cmd_n16t_PB(panel,
+			aod_enter ? DSI_CMD_SET_MI_AOD_ENTER :
+				    DSI_CMD_SET_MI_AOD_EXIT, update_bl);
+
+	if (aod_enter)
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_AOD_ENTER);
+	else
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_AOD_EXIT);
+
+	/* the commit path must not send a second aod enter on the next frame */
+	panel->mi_cfg.aod_enter_flags = false;
+	panel->mi_cfg.aod_exit_flags = false;
+
+	if (rc)
+		DSI_ERR("[%s] fod aod switch(%d) failed, rc=%d\n",
+			panel->name, aod_enter, rc);
+
+	DISP_TIME_INFO("%s fod %s aod: cur_fps=%d power_mode=%d(%s)"
+		" panel_state=%d doze_brightness=%d update_bl=%d\n",
+		panel->name, aod_enter ? "enter" : "exit",
+		panel->cur_mode->timing.refresh_rate, panel->power_mode,
+		get_display_power_mode_name(panel->power_mode),
+		panel->mi_cfg.panel_state, doze_brightness, update_bl);
 
 	return rc;
 }

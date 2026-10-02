@@ -1493,6 +1493,10 @@ int dsi_display_set_power(struct drm_connector *connector,
 		break;
 	case SDE_MODE_DPMS_ON:
 #ifdef MI_DISPLAY_MODIFY
+		/* hoshikv: a FOD press may own doze NOLP (power_mode faked to
+		 * DPMS_ON by dsi_panel_set_nolp). The dpms path takes the panel
+		 * over from here, so drop that bookkeeping first. */
+		mi_disp_lhbm_fod_doze_nolp_abort(display);
 		mi_dsi_hoshikv_doze_drop_locked(display);
 		if (mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PA ||
 			mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PB) {
@@ -1518,9 +1522,12 @@ int dsi_display_set_power(struct drm_connector *connector,
 #ifdef MI_DISPLAY_MODIFY
 		if (mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PA ||
 			mi_get_panel_id_by_dsi_panel(display->panel) == N16T_PANEL_PB) {
-			if (atomic_add_unless(&display->vid_aod_wakelock_count, -1 , 0))
-				pm_relax(&display->pdev->dev);
+		if (atomic_add_unless(&display->vid_aod_wakelock_count, -1 , 0))
+			pm_relax(&display->pdev->dev);
 		}
+
+		/* hoshikv: drop the FOD doze NOLP ownership, the panel goes off */
+		mi_disp_lhbm_fod_doze_nolp_abort(display);
 
 		if (mi_disp_lhbm_fod_enabled(display->panel))
 			mi_disp_lhbm_fod_allow_tx_lhbm(display, false);

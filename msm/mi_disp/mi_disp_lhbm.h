@@ -45,6 +45,10 @@
 #define HOSHIKV_FOD_HOLD_REARM_MS	500
 #define HOSHIKV_FOD_FPS_WAIT_MS		400
 #define HOSHIKV_FOD_WAIT_MS		250
+/* doze 30->120 must latch before the FOD HBM region lights; the DOZE_HBM cmd
+ * is skipped while a previous press still has its LHBM region marked on, so
+ * retry this many times (2-4ms apart) before queueing the HBM. */
+#define HOSHIKV_FOD_FPS_TRIES		10
 #define HOSHIKV_FOD_TOUCH_NODE		"/sys/class/touch/touch_dev/fod_press_status"
 #define HOSHIKV_FOD_STATE_ATTR		"hoshikv_fod_state"
 
@@ -108,6 +112,19 @@ struct disp_lhbm_fod {
 	unsigned long fod_fps_last_notify;
 int fod_fps_best_effort;	/* 1 = HAL didn't land 120Hz, inject HBM anyway */
 	int fod_dc_restore;		/* 1 = DC pulled off for HBM, restore on release */
+	int fod_nolp_on;		/* 1 = doze NOLP (full fps) owned by the FOD press */
+	int fod_nolp_prev_mode;	/* power_mode we faked away when entering NOLP */
+	int fod_sdm_doze;	/* 1 = SDM owns doze: driver must not touch
+				 * fps/brightness at all */
+	int fod_press_pending;	/* 1 = press seen, panel not in doze yet */
+	unsigned long fod_press_deadline;
+	/*
+	 * hoshikv: hoshikv_fod_hold_tick() only runs inside the watch kthread, and
+	 * v() (SET_FOD_MODE 0) stops that kthread. A hold armed just before the
+	 * stop would then never expire and the panel would sit at doze 120Hz for
+	 * good. This work re-arms the expiry independently of the kthread.
+	 */
+	struct delayed_work fod_hold_work;
   };
 
 struct lhbm_setting {
@@ -128,6 +145,9 @@ int mi_disp_lhbm_aod_to_normal_optimize(struct dsi_display *display,
 int mi_disp_set_local_hbm(int disp_id, int lhbm_value);
 int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id, bool enable);
 int mi_disp_lhbm_fod_state_pub_get(int disp_id);
+void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display);
+bool mi_disp_lhbm_fod_nolp_active(struct dsi_panel *panel);
+bool mi_disp_lhbm_fod_sdm_doze_active(struct dsi_display *display);
 int mi_disp_update_0size_lhbm_layer(struct dsi_display *dsi_display,
 			u32 mi_gxzw_flags);
 int mi_disp_update_0size_lhbm_info(struct dsi_panel *panel);

@@ -344,6 +344,8 @@ ssize_t mi_dsi_panel_show_disp_param(struct dsi_panel *panel,
 int mi_dsi_panel_set_doze_brightness(struct dsi_panel *panel,
 			u32 doze_brightness);
 
+int mi_dsi_panel_hoshikv_doze_fps(struct dsi_panel *panel, bool to_fod);
+
 int mi_dsi_panel_get_doze_brightness(struct dsi_panel *panel,
 			u32 *doze_brightness);
 
@@ -423,5 +425,11 @@ int mi_dsi_update_aod_cmd_n16t_PB(struct dsi_panel *panel,
 		enum dsi_cmd_set_type type, int bl_lvl);
 
 int mi_dsi_panel_gamma_switch_n16t_PB(struct dsi_panel *panel);
+
+int mi_dsi_panel_fod_aod_switch_locked(struct dsi_panel *panel, bool aod_enter);
+int mi_dsi_panel_fod_gamma_locked(struct dsi_panel *panel);
+int mi_dsi_panel_fod_nolp_enter_locked(struct dsi_panel *panel);
+
+bool mi_disp_lhbm_fod_nolp_active(struct dsi_panel *panel);
 
 #endif /* _MI_DSI_PANEL_H_ */

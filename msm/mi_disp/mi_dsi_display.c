@@ -18,6 +18,7 @@
 #include "mi_disp_feature.h"
 #include "mi_panel_id.h"
 #include "mi_disp_flatmode.h"
+#include "mi_disp_lhbm.h"
 #include "drm/drm_mipi_dsi.h"
 #include "sde_vm.h"
 
@@ -1589,9 +1590,6 @@ MODULE_PARM_DESC(debugpolicy, "msm_drm.debugpolicy=<debug policy> to indicate su
  */
 void mi_dsi_hoshikv_doze_ensure_locked(struct dsi_display *display)
 {
-	u32 cur = 0;
-	int rc;
-
 	if (!display || !display->panel)
 		return;
 
@@ -1604,34 +1602,50 @@ void mi_dsi_hoshikv_doze_ensure_locked(struct dsi_display *display)
 		return;
 	}
 
-	rc = mi_dsi_display_get_doze_brightness(display, &cur);
-	if (!rc && cur == DOZE_BRIGHTNESS_HBM)
+	/* the fingerprint press owns the doze link while it is up; a doze
+	 * brightness event landing on top of it would push the panel back into
+	 * lp doze (the doze hbm command set carries the nolp bit) and grey the
+	 * running fingerprint ui */
+	if (mi_disp_lhbm_fod_nolp_active(display->panel)) {
+		DISP_INFO("hoshikv-doze2: FOD doze ui active, skip doze brightness\n");
 		return;
+	}
 
-	rc = mi_dsi_display_set_doze_brightness_locked(display,
-			DOZE_BRIGHTNESS_HBM);
-	DISP_INFO("hoshikv-doze2: arm doze HBM, rc=%d\n", rc);
+	/*
+	 * Full AOD: SDM owns the doze ramp, so the driver must not send
+	 * DOZE_HBM/DOZE_LBM here. Arming DOZE_HBM on top of an SDM doze is what
+	 * pushed the panel out of aod gamma mid-FOD and flashed green.
+	 */
+	if (mi_disp_lhbm_fod_sdm_doze_active(display)) {
+		DISP_INFO("hoshikv-doze2: full AOD, SDM owns doze, skip\n");
+		return;
+	}
+
+	/* own 120Hz (DOZE_HBM cmd), no Xiaomi doze_brightness */
+	mi_dsi_panel_hoshikv_doze_fps(display->panel, true);
 }
 
 void mi_dsi_hoshikv_doze_drop_locked(struct dsi_display *display)
 {
-	u32 cur = 0;
-
 	if (!display || !display->panel)
 		return;
+
+	/* full AOD: SDM owns doze, so do not drag the panel back to 30Hz from
+	 * under it either */
+	if (mi_disp_lhbm_fod_sdm_doze_active(display)) {
+		DISP_INFO("hoshikv-doze2: full AOD, SDM owns doze, skip drop\n");
+		return;
+	}
 
 	/* still in doze and FOD is live -> keep it */
 	if ((display->panel->power_mode == SDE_MODE_DPMS_LP1 ||
 		display->panel->power_mode == SDE_MODE_DPMS_LP2) &&
-		is_hbm_fod_on(display->panel))
+		(is_hbm_fod_on(display->panel) ||
+		 mi_disp_lhbm_fod_nolp_active(display->panel)))
 		return;
 
-	if (!mi_dsi_display_get_doze_brightness(display, &cur) &&
-		cur == DOZE_TO_NORMAL)
-		return;
-
-	DISP_INFO("hoshikv-doze2: drop doze brightness to normal\n");
-	mi_dsi_display_set_doze_brightness_locked(display, DOZE_TO_NORMAL);
+	/* own 30Hz (DOZE_LBM cmd), no Xiaomi doze_brightness */
+	mi_dsi_panel_hoshikv_doze_fps(display->panel, false);
 }
 
 void mi_dsi_hoshikv_doze_ensure(struct dsi_display *display)

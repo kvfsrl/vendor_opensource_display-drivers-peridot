@@ -100,6 +100,9 @@ ssize_t mi_disp_read(struct file *filp, char __user *buffer,
 {
 	struct disp_feature_client *client = filp->private_data;
 	struct disp_feature *df = client->df;
+	struct disp_pending_event *e;
+	unsigned int length, chunk;
+	unsigned long flags;
 	int ret = 0;
 
 	ret = mutex_lock_interruptible(&client->event_lock);
@@ -107,14 +110,22 @@ ssize_t mi_disp_read(struct file *filp, char __user *buffer,
 		return ret;
 
 	for (;;) {
-		struct disp_pending_event *e = NULL;
+		e = NULL;
 
 		spin_lock_irq(&df->client_spinlock);
 		if (!list_empty(&client->event_list)) {
 			e = list_first_entry(&client->event_list,
 					struct disp_pending_event, link);
-			client->event_space += e->event.base.length;
-			list_del(&e->link);
+			length = e->event.base.length;
+			if (client->read_pos >= length) {
+				/* whole event was already consumed */
+				client->event_space += length;
+				list_del(&e->link);
+				spin_unlock_irq(&df->client_spinlock);
+				kfree(e);
+				client->read_pos = 0;
+				continue;
+			}
 		}
 		spin_unlock_irq(&df->client_spinlock);
 
@@ -134,34 +145,41 @@ ssize_t mi_disp_read(struct file *filp, char __user *buffer,
 				ret = mutex_lock_interruptible(&client->event_lock);
 			if (ret)
 				return ret;
-		} else {
-			unsigned length = e->event.base.length;
-
-			if (length > count - ret) {
-put_back_event:
-				spin_lock_irq(&df->client_spinlock);
-				client->event_space -= length;
-				list_add(&e->link, &client->event_list);
-				spin_unlock_irq(&df->client_spinlock);
-				wake_up_interruptible(&client->event_wait);
-				break;
-			}
-
-			DISP_DEBUG("%s display event type: %s\n",
-				get_disp_id_name(e->event.base.disp_id),
-				get_disp_event_type_name(e->event.base.type));
-			DISP_DEBUG("%s display event length: %d\n",
-				get_disp_id_name(e->event.base.disp_id), length);
-
-			if (copy_to_user(buffer + ret, &e->event, length)) {
-				if (ret == 0)
-					ret = -EFAULT;
-				goto put_back_event;
-			}
-
-			ret += length;
-			kfree(e);
+			continue;
 		}
+
+		/* Hand an event across successive reads: a client may read the
+		 * disp_event header (12 bytes) first, then the payload, so a
+		 * short read must continue from where it left off instead of
+		 * putting the whole event back and returning 0.
+		 */
+		chunk = length - client->read_pos;
+		if (chunk > count - ret)
+			chunk = count - ret;
+		if (chunk == 0)
+			break;
+
+		if (copy_to_user(buffer + ret, (u8 *)&e->event + client->read_pos,
+				chunk)) {
+			if (ret == 0)
+				ret = -EFAULT;
+			break;
+		}
+
+		client->read_pos += chunk;
+		ret += chunk;
+
+		if (client->read_pos == length) {
+			spin_lock_irqsave(&df->client_spinlock, flags);
+			client->event_space += length;
+			list_del(&e->link);
+			spin_unlock_irqrestore(&df->client_spinlock, flags);
+			kfree(e);
+			client->read_pos = 0;
+		}
+
+		if (ret == count)
+			break;
 	}
 	mutex_unlock(&client->event_lock);
 
