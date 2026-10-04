@@ -853,6 +853,24 @@ static int hoshikv_fod_doze_nolp_enter(struct disp_lhbm_fod *lhbm_fod)
 			mi_cfg->doze_brightness = DOZE_BRIGHTNESS_HBM;
 		}
 
+		/*
+		 * hoshikv: force a fresh DOZE_HBM_NOLP send on every press.
+		 * panel_state can still read PANEL_STATE_ON from a stale
+		 * aod_to_normal_statue left over from an earlier cycle: when SDM
+		 * drives the panel back to the doze gamma directly, the cmd-set
+		 * path (dsi_panel_set_lp2) skips because the flag says the panel is
+		 * already in aod, so panel_state/aod_to_normal_statue are never
+		 * reset to a doze value. On the next press the feature handler
+		 * then hits "enable while already ON" -> -EAGAIN and never sends
+		 * DOZE_HBM_NOLP, so the HBM lights on a panel that is still in the
+		 * lp aod gamma -> greying/green tint. Reset the flag to the doze
+		 * state first so the handler takes its real enable branch and
+		 * re-sends the command set (it sets panel_state back to ON on
+		 * success).
+		 */
+		mi_cfg->panel_state = PANEL_STATE_DOZE_HIGH;
+		mi_cfg->aod_to_normal_statue = false;
+
 		rc = mi_disp_lhbm_aod_to_normal_optimize(lhbm_fod->display,
 				true);
 
