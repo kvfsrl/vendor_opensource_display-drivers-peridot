@@ -857,48 +857,42 @@ static int hoshikv_fod_doze_nolp_enter(struct disp_lhbm_fod *lhbm_fod)
 				true);
 
 		/*
-		 * hoshikv: only claim SDM doze ownership once the panel really left
-		 * doze. Setting fod_sdm_doze before knowing the outcome is what made
-		 * the release path run (and drop the panel back to 30Hz) 432us after
-		 * the press, before the 3s hold could ever be observed: the enter
-		 * below had already returned -EAGAIN, but the flag still said we
-		 * owned doze.
-		 */
-		lhbm_fod->fod_sdm_doze = 1;
-
-		/*
-		 * The handler refuses while FOD HBM is already lit
-		 * (mi_dsi_panel.c:4138) and on repeat presses it returns -EAGAIN
-		 * because panel_state is already ON. Reaching here with the panel
-		 * still in LP2 means the transition never happened, so clear the
-		 * NOLP ownership flags: dsi_panel_set_lp1()/set_lp2() consult
-		 * aod_to_normal_statue and would otherwise skip the lp
-		 * transition and leave the panel painted grey.
-		 */
-
-		/*
-		 * Retry here instead of leaving it to sde_encoder.c: that
-		 * retry only runs on a committed video frame, and a FOD press
-		 * out of doze commits no frame. So a request that came back
-		 * -EAGAIN (or that the handler declined because panel_state
-		 * was already ON) would just sit pending forever: HBM lit at
-		 * 1000nit on a panel still sitting in LP2 aod gamma, blinking
-		 * grey/green on every press, never recovering.
+		 * hoshikv: -EAGAIN from the feature handler is NOT a failure here.
+		 * mi_dsi_panel_aod_to_normal_optimize_locked() falls into its final
+		 * else (mi_dsi_panel.c:4206) when it is asked to enable while the
+		 * panel is already PANEL_STATE_ON, i.e. it declined because the
+		 * DOZE_HBM_NOLP set is already in place -- precisely the state we
+		 * want.
 		 *
-		 * Keep nudging until the panel actually leaves doze. Bounded so
-		 * a wedged panel cannot spin here.
+		 * Judging the outcome on rc left aod_to_normal_statue false while the
+		 * panel was in fact on. dsi_panel_set_lp1() consults that flag before
+		 * dragging the panel back into lp, so it pulled the panel straight
+		 * back to 30Hz and doze 120Hz never lasted through the touch.
+		 * panel_state is the ground truth: normalise rc from it.
 		 */
-		if (rc != 0 || mi_cfg->panel_state != PANEL_STATE_ON) {
+		if (mi_cfg->panel_state == PANEL_STATE_ON) {
+			rc = 0;
+		} else {
 			int tries;
 
+			/*
+			 * Retry here instead of leaving it to sde_encoder.c: that
+			 * retry only runs on a committed video frame, and a FOD press
+			 * out of doze commits no frame. So a request that never moved
+			 * the panel out of doze would just sit pending forever: HBM
+			 * lit at 1000nit on a panel still sitting in LP2 aod gamma,
+			 * blinking grey/green on every press, never recovering.
+			 */
 			for (tries = HOSHIKV_FOD_FPS_TRIES; tries > 0; tries--) {
 				usleep_range(8000, 12000);
 				rc = mi_disp_lhbm_aod_to_normal_optimize(
 						lhbm_fod->display, true);
-				if (!rc && mi_cfg->panel_state == PANEL_STATE_ON)
+				if (mi_cfg->panel_state == PANEL_STATE_ON) {
+					rc = 0;
 					break;
+				}
 			}
-			if (rc || mi_cfg->panel_state != PANEL_STATE_ON)
+			if (mi_cfg->panel_state != PANEL_STATE_ON)
 				DISP_ERROR("hoshikv-fod: SDM doze NOLP failed"
 					" after %d tries (rc=%d, state=%d)\n",
 					HOSHIKV_FOD_FPS_TRIES - tries, rc,
@@ -908,17 +902,32 @@ static int hoshikv_fod_doze_nolp_enter(struct disp_lhbm_fod *lhbm_fod)
 		/*
 		 * aod_to_normal_statue is what dsi_panel_set_lp1() checks
 		 * before dragging the panel back into lp (dsi_panel.c:5130).
-		 * Keep it consistent with the retry result so a late lp1
-		 * transition cannot yank the panel out from under a lit
-		 * fingerprint.
+		 * Derive it from panel_state alone, never from rc, or a panel that
+		 * is genuinely out of doze still gets pulled back into lp.
 		 */
 		mi_cfg->aod_to_normal_statue =
-			(!rc && mi_cfg->panel_state == PANEL_STATE_ON);
+			(mi_cfg->panel_state == PANEL_STATE_ON);
 		mi_cfg->aod_to_normal_pending = !mi_cfg->aod_to_normal_statue;
 
 		DISP_INFO("hoshikv-fod: SDM doze requested (rc=%d, mode=%d,"
-				" state=%d, pending=%d)\n", rc, panel->power_mode,
-				mi_cfg->panel_state, mi_cfg->aod_to_normal_pending);
+			" state=%d, pending=%d)\n", rc, panel->power_mode,
+			mi_cfg->panel_state, mi_cfg->aod_to_normal_pending);
+
+		if (!mi_cfg->aod_to_normal_statue) {
+			/* hoshikv: never claim ownership we do not have. Returning
+			 * the real failure lets the caller retry and keeps the HBM
+			 * from being queued on a panel still sitting in doze. */
+			return -EAGAIN;
+		}
+
+		/*
+		 * hoshikv: only claim SDM doze ownership once the panel really left
+		 * doze. Setting fod_sdm_doze before knowing the outcome is what made
+		 * the release path run (and drop the panel back to 30Hz) 432us after
+		 * the press, before the 3s hold could ever be observed.
+		 */
+		lhbm_fod->fod_sdm_doze = 1;
+
 		return 0;
 	}
 
@@ -1138,12 +1147,15 @@ void mi_disp_lhbm_fod_doze_nolp_abort(struct dsi_display *display,
 
 	/*
 	 * hoshikv: this used to tear the hold down unconditionally, and the
-	 * FOD doze->normal DPMS walk fired it ~40ms after the panel went to 120Hz,
-	 * so doze 120Hz never lasted longer than that. Keep the hold (and the
-	 * timer) while a FOD touch is still live; only drop the NOLP flags.
+	 * FOD doze->normal DPMS walk fired it ~40ms after the panel went to
+	 * 120Hz, so doze 120Hz never lasted longer than that.
+	 *
+	 * Do NOT gate on fod_watch_en: the watch kthread calls v() and clears it
+	 * on every transition, so by the time this DPMS walk arrives it is
+	 * already 0 and a guard on it never fires. The armed hold with a
+	 * deadline still in the future is the reliable signal.
 	 */
-	if (keep_fod && atomic_read(&lhbm_fod->fod_watch_en) &&
-	    lhbm_fod->fod_hold_armed &&
+	if (keep_fod && lhbm_fod->fod_hold_armed &&
 	    time_before(jiffies, lhbm_fod->fod_hold_deadline)) {
 		lhbm_fod->fod_nolp_on = 0;
 		lhbm_fod->fod_nolp_prev_mode = 0;
@@ -1247,9 +1259,19 @@ static void hoshikv_fod_press(struct disp_lhbm_fod *lhbm_fod)
 				break;
 			usleep_range(2000, 4000);
 		}
-		if (nolp_rc)
+		if (nolp_rc) {
+			/* hoshikv: the panel never left doze. Queuing HBM here lit
+			 * 1000nit on a panel still sitting in the lp aod gamma, which
+			 * is the "fod anim but grey/green panel" case. Remember the
+			 * press and let the watch loop retry once doze is real; the
+			 * HBM goes in then, after 120Hz is actually up. */
+			lhbm_fod->fod_press_pending = 1;
+			lhbm_fod->fod_press_deadline =
+				jiffies + msecs_to_jiffies(HOSHIKV_FOD_HOLD_MS);
 			DISP_ERROR("hoshikv-fod: doze NOLP latch failed"
-				" (rc=%d)\n", nolp_rc);
+				" (rc=%d), HBM deferred\n", nolp_rc);
+			return;
+		}
 
 		/* (re)start the 3s hold so back-to-back touches keep doze NOLP */
 		hoshikv_fod_hold_arm(lhbm_fod);
@@ -1523,11 +1545,15 @@ static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 				cur = hoshikv_fod_touch_read(lhbm_fod);
 			mutex_unlock(&lhbm_fod->fod_touch_lock);
 
-			hoshikv_fod_hold_tick(lhbm_fod);
-
 			/* act only on a value transition; poll may stay ready even
 			 * when the value is unchanged, so this is what keeps the
-			 * kthread from busy-looping on a flat value */
+			 * kthread from busy-looping on a flat value.
+			 *
+			 * hoshikv: the transition is handled BEFORE hold_tick(). The
+			 * other order let the expiry worker fire on the *old* deadline
+			 * in the same tick that a re-touch was re-arming it, so the
+			 * worker could drop doze 120Hz right under a finger that was
+			 * still down. */
 			if (cur != last) {
 				hoshikv_fod_publish(lhbm_fod, cur);
 				if (cur)
@@ -1535,6 +1561,8 @@ static int mi_disp_lhbm_fod_watch_thread_fn(void *arg)
 				else
 					hoshikv_fod_release(lhbm_fod);
 			}
+
+			hoshikv_fod_hold_tick(lhbm_fod);
 
 			/* bounded sleep floor (awake nodes can report ready forever) */
 			wait_event_interruptible_timeout(lhbm_fod->fod_poll_wq,
@@ -1595,16 +1623,21 @@ int mi_disp_lhbm_fod_watch_enable(struct disp_feature *df, int disp_id,
 		 */
 		if (lhbm_fod->fod_hold_armed &&
 		    time_before(jiffies, lhbm_fod->fod_hold_deadline)) {
+			/* hoshikv: the 30Hz restore is what actually drops doze
+			 * 120Hz, so it must not run while the hold is live. Only
+			 * hoshikv_fod_hold_expire_work() may put the panel back to
+			 * 30Hz, and it does that 3s after the last touch. */
 			DISP_INFO("hoshikv-fod: v() during hold, keeping"
-				" doze NOLP until timeout\n");
+				" doze 120Hz until timeout\n");
 		} else {
 			lhbm_fod->fod_hold_armed = 0;
 			cancel_delayed_work_sync(&lhbm_fod->fod_hold_work);
 			/* v() drops the FOD UI: give doze NOLP back */
 			hoshikv_fod_doze_nolp_leave(lhbm_fod);
+			/* own 30Hz restore, no Xiaomi doze_brightness */
+			mi_dsi_panel_hoshikv_doze_fps(lhbm_fod->display->panel,
+					false);
 		}
-		/* own 30Hz restore, no Xiaomi doze_brightness */
-		mi_dsi_panel_hoshikv_doze_fps(lhbm_fod->display->panel, false);
 		/* SET_FOD_MODE(0) = v(): do NOT publish 0 here. The fingerprint
 		 * animation (onFpTouch) must stay true until finger-up. Publishing 0
 		 * on v() cuts the fod animation mid-sequence at the lockscreen. The
